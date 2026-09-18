@@ -1,4 +1,5 @@
 {
-  "model": "sonnet",
+  "model": "claude-fable-5-1[1m]",
+  "tui": "fullscreen",
   "theme": "auto"
 }

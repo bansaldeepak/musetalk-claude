@@ -1,0 +1,387 @@
+# Cold Start Optimization — Research & Benchmarks
+
+> Measured 2026-09-09 on g6e.xlarge (L40S, ap-south-2).
+> Branch: `perf/s3-avatar-cache`
+> Stack: production image (PyTorch 2.1.0 + cu121) — these numbers are comparable
+> to production, unlike `archive/fork-benchmarks/`.
+>
+> **Caveat (2026-09-16):** the ~48 s cold start in §5 was produced with hand-run
+> tuned `s5cmd cp` commands. The committed `docker-entrypoint.sh` still runs
+> parallel `s5cmd sync` with default concurrency, which §3 measured as slower.
+> Plan item Q1 aligns the script with the measurement and re-measures.
+
+---
+
+## Problem
+
+Cold start without pre-built avatar cache takes **7+ minutes** (DWPose + VAE encode +
+geometry for 1874 frames). Even with a pre-built cache on S3, the download + Python
+startup totalled **90+ seconds** in the initial (untuned) implementation. The goal is to
+bring cold start as close to warm start as possible.
+
+---
+
+## 1. Instance Hardware
+
+```
+Instance:  g6e.xlarge (L40S GPU, 32 GB RAM, 4 vCPU)
+Network:   "Up to 25 Gbps" — bursts to ~700 MB/s for first ~3.5 GB,
+           then drops to ~270 MB/s (2.1 Gbps) baseline
+EBS root:  gp3 150 GB — 125 MB/s throughput (default), 3000 IOPS
+NVMe SSD:  /opt/dlami/nvme — 232.8 GB local instance store, 2+ GB/s seq read/write
+```
+
+| Storage | Read speed | Write speed | Persists across | Cost |
+|---------|-----------|-------------|-----------------|------|
+| EBS gp3 (default) | 125 MB/s | 125 MB/s | Everything (durable) | Included |
+| EBS gp3 (provisioned 1000 MB/s) | 1000 MB/s | 1000 MB/s | Everything | +$40/mo |
+| NVMe local | 2+ GB/s | 312 MB/s (dd), burst higher | Container restart YES, instance stop NO | $0 |
+| tmpfs | Memory speed | Memory speed | Nothing | Uses RAM |
+
+---
+
+## 2. Data Inventory
+
+### Model weights needed at runtime (4.2 GB)
+
+| File | Size |
+|------|------|
+| musetalkV15/unet.safetensors | 3.2 GB |
+| dwpose/dw-ll_ucoco_384.pth | 388 MB |
+| sd-vae/diffusion_pytorch_model.safetensors | 319 MB |
+| whisper/pytorch_model.bin | 144 MB |
+| s3fd/s3fd.pth | 86 MB |
+| face-parse-bisent/79999_iter.pth | 51 MB |
+| face-parse-bisent/resnet18-5c106cde.pth | 45 MB |
+| + 4 small config JSONs | <1 MB |
+| **Total** | **4.2 GB** |
+
+### Model files NOT needed (excluded from S3 sync)
+
+| File | Size | Why excluded |
+|------|------|-------------|
+| musetalk/pytorch_model.bin | 3.2 GB | Old v1 model, unused |
+| musetalkV15/unet.pth | 3.2 GB | Superseded by .safetensors (auto-detected by UNet class) |
+| syncnet/latentsync_syncnet.pt | 1.4 GB | Not loaded at runtime |
+| .cache/huggingface/* | ~1 MB | HuggingFace metadata, not needed |
+| **Total excluded** | **~7.8 GB** | |
+
+### Avatar cache (5.9 GB per avatar)
+
+| File | Size | Notes |
+|------|------|-------|
+| runtime/rgb_frames.npy | 2.7 GB | 1874 × 720 × 720 × 3 uint8 |
+| runtime/idle_frames.npy | 2.7 GB | 1874 × 720 × 720 × 3 uint8 |
+| runtime/base_part.npy | 280 MB | Compositing geometry |
+| runtime/alpha.npy | 93 MB | Alpha mask |
+| latents.pt | 15 MB | VAE latents |
+| Other (coords, meta, etc.) | <2 MB | |
+| **Total** | **5.9 GB** | |
+
+### Grand total: ~10.1 GB needed at runtime
+
+---
+
+## 3. S3 Transfer Benchmarks
+
+Bucket: `s3://taiboli-dev-ml-weights` (ap-south-2, same region as instance).
+
+### s5cmd vs aws cli
+
+| Method | What | Time | Throughput |
+|--------|------|------|-----------|
+| `aws s3 cp \| tar` → disk | Single stream pipe | 26s for 5.8 GB | 223 MB/s |
+| `aws s3 sync` (64 threads) | Still single-connection per file | 26s | 223 MB/s |
+| `s5cmd sync` (64 workers) | Go parallel multi-stream | 7.1s for 5.8 GB | 830 MB/s |
+| `s5cmd cp` (tuned: c=32 p=32) | Higher per-file concurrency | 4.7s for 4.2 GB | 890 MB/s |
+
+**s5cmd is 3-4x faster than aws cli** due to parallel HTTP/2 streams.
+
+### Tuning s5cmd
+
+Default: `--numworkers 256`, `--concurrency 5`, `--part-size 50` (MB).
+Tuned: `--numworkers 256`, `--concurrency 32`, `--part-size 32`.
+
+Single 3.2 GB file results:
+
+| Setting | tmpfs (no disk) | NVMe |
+|---------|----------------|------|
+| Default (c=5, p=50) | 7.4s (432 MB/s) | 7.4s |
+| Tuned (c=32, p=32) | 4.4s (727 MB/s) | ~5s |
+
+### Network burst behavior (critical finding)
+
+The g6e.xlarge "up to 25 Gbps" is **burstable**:
+
+| What | Observation |
+|------|-------------|
+| First ~3.5 GB | Burst speed: ~700 MB/s (5.6 Gbps) |
+| After burst depleted | Baseline: ~270 MB/s (2.1 Gbps) |
+| Burst refill | ~60 seconds to get burst back |
+
+Evidence — two back-to-back downloads to tmpfs after 60s rest:
+- File 1 (3.2 GB): **4.4s** — burst available
+- File 2 (2.7 GB): **10.1s** — burst exhausted, baseline only
+
+This explains why 10 GB always takes ~28s regardless of tuning:
+first 3.5 GB at burst (~5s) + remaining 6.5 GB at baseline (~24s) ≈ 28-30s.
+
+### `sync` vs `cp` overhead
+
+s5cmd `sync` does an S3 LIST + comparison before downloading. On empty
+directories (cold start), this adds 10-15s for no benefit.
+
+| Command | Avatar cache (5.9 GB) | Notes |
+|---------|----------------------|-------|
+| `s5cmd sync` | 10-22s (varies) | LIST overhead |
+| `s5cmd cp` | 7.7s | Direct download |
+
+**Use `cp` not `sync` for cold start** (destination is always empty).
+
+### Parallel download contention
+
+Two s5cmd processes (models + avatar cache) in parallel:
+
+| Test | Time | Note |
+|------|------|------|
+| Models alone | 7.6s | |
+| Avatar alone | 7.7s | |
+| Both parallel (2 × s5cmd) | 29-50s | Worse than sequential! |
+| Sequential (models → avatar) | 30s | Second download gets baseline speed |
+| Single s5cmd batch (all 21 files) | 28s | Same — burst depletes |
+
+**Parallel doesn't help** when total data exceeds burst budget (~3.5 GB).
+Running two s5cmd processes can be WORSE due to connection overhead.
+
+### Compression test
+
+| File | Original | zstd -1 | Ratio |
+|------|----------|---------|-------|
+| rgb_frames.npy (uint8 pixels) | 2.91 GB | 1.81 GB | 1.6x |
+
+Raw uint8 video frames don't compress well. Not worth the complexity.
+
+---
+
+## 4. Storage Read Benchmarks
+
+### EBS page cache behavior
+
+| Scenario | Time | Notes |
+|----------|------|-------|
+| 10 GB EBS → page cache (cold, parallel cat) | **80s** | 125 MB/s hard cap |
+| EBS→NVMe copy (cp) | **80s** | Same — limited by EBS read |
+| Page cache already warm (re-read) | <1s | Memory speed |
+
+**EBS throughput is 125 MB/s regardless of parallelism.** Multiple readers
+share the same bandwidth cap.
+
+### NVMe read speed
+
+Model files read from NVMe at 2+ GB/s — I/O is not the bottleneck.
+The 7s model load time is dominated by PyTorch deserialization + GPU transfer.
+
+---
+
+## 5. Full Container Start Benchmarks
+
+All tests mount updated `main_server.py` with relaxed `_cache_exists()` so the
+runtime-only avatar cache (no `full_imgs/`, no `mask/`) is accepted.
+
+### Data already local (no S3 download needed)
+
+| Scenario | Total | Breakdown |
+|----------|-------|-----------|
+| **NVMe, warm** (container restart) | **20s** | 5s container, 4s imports, 7s model load, 0.5s cache, 3s GPU warmup |
+| **EBS, warm page cache** (container restart) | **28s** | 9s container, 6s imports, 7s model load, 0.5s cache, 5s GPU warmup |
+| **EBS, cold page cache** (first boot) | **49s** | 24s container+imports (EBS-bound), 7s model, 2.5s cache, 4s GPU, 10s imports |
+
+### With S3 download
+
+| Scenario | Total | Breakdown |
+|----------|-------|-----------|
+| **S3→NVMe + start** (s5cmd, tuned) | **~48s** | 28s S3 download + 20s Python |
+| **S3→NVMe + start** (aws cli, no excludes) | **~90s** | 72s S3 download + 18s Python |
+
+---
+
+## 6. Python Startup Breakdown (15s floor)
+
+Measured on NVMe (no I/O bottleneck):
+
+| Phase | Time | What |
+|-------|------|------|
+| Container overhead | ~5s | Docker layer setup, entrypoint |
+| Top-level imports (torch, aiortc, numpy) | ~2s | .so/.pyc loading |
+| `_import_musetalk()` (transformers, mmcv, DWPose) | ~2s | Heavy lazy imports |
+| `load_all_model()` — UNet + VAE + Whisper | ~7s | safetensors deserialization + GPU transfer |
+| Avatar cache load (runtime geometry) | ~0.5s | mmap numpy arrays |
+| GPU warmup (batch 1–4 inference) | ~3s | CUDA kernel compilation + warm path |
+| **Total** | **~20s** | |
+
+The UNet (3.2 GB safetensors) dominates model load at ~5s of the 7s. The
+`print("load unet model from ...")` message appears BEFORE the safetensors
+auto-detect — the actual loading uses safetensors when present (see
+`musetalk/models/unet.py:44-49`).
+
+### Next optimization target: reduce 15s Python startup
+
+Ideas to investigate:
+- Lazy/deferred model loading (load after first WebRTC connection)
+- Persistent process (don't re-import on restart)
+- torch.compile / CUDA graph caching across restarts
+- Reduce VAE/Whisper load time (smaller models, quantization)
+- Overlap model GPU transfer with GPU warmup
+
+---
+
+## 7. Architecture Options
+
+### Option A: EBS as durable source (simplest)
+
+```
+Instance setup (one-time):
+  S3 → EBS (/opt/models, /opt/avatar-cache)
+
+Container start:
+  docker run -v /opt/models:/app/models -v /opt/avatar-cache:/app/results/v15/avatars
+```
+
+| Event | Time | Notes |
+|-------|------|-------|
+| Container restart | **28s** | EBS warm page cache |
+| First boot after instance start | **49s** | EBS cold page cache |
+| Instance setup | ~28s | S3→EBS (one-time) |
+
+**Pros:** Simple, durable, no NVMe dependency, supports multiple containers
+sharing same data. No re-download on restart.
+
+**Cons:** 49s first boot (cold EBS cache). 28s restart (8s slower than NVMe).
+
+### Option B: S3 → NVMe at boot (fastest cold start)
+
+```
+start-musetalk.sh:
+  s5cmd sync S3 → /opt/dlami/nvme/models
+  s5cmd sync S3 → /opt/dlami/nvme/avatar-cache
+  docker run -v /opt/dlami/nvme/models:/app/models ...
+```
+
+| Event | Time | Notes |
+|-------|------|-------|
+| Container restart | **20s** | NVMe data persists across restart |
+| First boot (S3→NVMe + start) | **~48s** | 28s download + 20s Python |
+| Instance stop/start | 28s re-download | NVMe wiped |
+
+**Pros:** Fastest restart (20s). NVMe read speed eliminates I/O bottleneck.
+
+**Cons:** 28s S3 download on every instance start. NVMe ephemeral.
+
+### Option C: EBS durable + NVMe hot copy (hybrid)
+
+```
+Instance setup (one-time):
+  S3 → EBS
+
+start-musetalk.sh:
+  if NVMe empty: cp EBS → NVMe (80s) OR s5cmd S3 → NVMe (28s)
+  docker run -v /opt/dlami/nvme/...
+```
+
+| Event | Time | Notes |
+|-------|------|-------|
+| Container restart | **20s** | NVMe already populated |
+| First boot (S3→NVMe) | **48s** | Use S3 not EBS for NVMe fill |
+| Instance stop/start | 28s S3→NVMe | Don't copy from EBS (80s), go direct S3 |
+
+**Pros:** Best restart time. EBS as backup. S3→NVMe faster than EBS→NVMe.
+
+**Cons:** More moving parts. Still 28s network bottleneck on first boot.
+
+### Option D: Increase EBS throughput ($$)
+
+Provision gp3 at 1000 MB/s instead of default 125 MB/s.
+Cost: ~$40/month extra.
+
+| Event | Time | Notes |
+|-------|------|-------|
+| First boot | **~15s** | 10 GB at 1000 MB/s = 10s page cache warm |
+| Container restart | **~20s** | Page cache at memory speed |
+
+**Pros:** Simplest to implement. Makes EBS performance match NVMe for reads.
+
+**Cons:** $40/month. Still doesn't help with S3 download speed.
+
+---
+
+## 8. S3 Data Layout
+
+```
+s3://taiboli-dev-ml-weights/
+├── avatar-cache-v2/
+│   └── avator_1/                 # Individual files (parallel download)
+│       ├── avatar_info.json
+│       ├── coords.pkl
+│       ├── latents.pt
+│       ├── mask_coords.pkl
+│       └── runtime/
+│           ├── alpha.npy          93 MB
+│           ├── base_part.npy      280 MB
+│           ├── idle_frames.npy    2.7 GB
+│           ├── idle_prompt.npy    75 KB
+│           ├── meta.json
+│           └── rgb_frames.npy     2.7 GB
+├── models/                       # All models (S3 sync with excludes)
+│   ├── musetalkV15/unet.safetensors   3.2 GB  ← needed
+│   ├── musetalkV15/unet.pth           3.2 GB  ← EXCLUDED (superseded)
+│   ├── musetalk/pytorch_model.bin      3.2 GB  ← EXCLUDED (v1)
+│   ├── syncnet/                        1.4 GB  ← EXCLUDED (unused)
+│   ├── dwpose/                         388 MB  ← needed
+│   ├── sd-vae/                         319 MB  ← needed
+│   ├── whisper/                        144 MB  ← needed
+│   ├── s3fd/                           86 MB   ← needed
+│   └── face-parse-bisent/              96 MB   ← needed
+└── avatar-cache/
+    └── avator_1.tar              # Legacy tar (original approach, unused)
+```
+
+---
+
+## 9. Code Changes (this branch)
+
+### docker-entrypoint.sh
+
+- `weights_present()`: requires `unet.safetensors` instead of `unet.pth`;
+  dropped old v1 `musetalk/pytorch_model.bin` from required list
+- `s3_sync()`: helper using s5cmd (with aws cli fallback), accepts extra
+  args like `--exclude`
+- Parallel download when both models + avatar cache needed
+- Exclude patterns skip 7.8 GB of unused model files
+- Page cache pre-warm list updated (no `unet.pth`)
+
+### Dockerfile
+
+- `s5cmd` v2.2.2 binary installed at build time
+
+### main_server.py (already on main)
+
+- `_cache_exists()` relaxed to accept runtime-only cache (no `full_imgs/`,
+  no `mask/` required when `runtime/` geometry exists)
+
+---
+
+## 10. Infrastructure Changes Needed
+
+### Already done
+- [x] Avatar cache uploaded as individual files to `avatar-cache-v2/`
+- [x] Model weights on S3 at `models/`
+- [x] s5cmd added to Dockerfile
+- [x] Entrypoint handles S3 download with excludes
+- [x] VPC Gateway Endpoint for S3 created
+
+### Still needed
+- [ ] Add S3_WEIGHTS_URI, S3_AVATAR_CACHE_URI, AWS_REGION to SSM Parameter Store
+- [ ] Update `start-musetalk.sh` with chosen volume mount strategy
+- [ ] Build and push new ECR image (current image predates s5cmd + entrypoint changes)
+- [ ] Verify VPC endpoint is attached to correct route table and routing S3 traffic
+- [ ] Investigate Python startup reduction (15s floor — see section 6)
