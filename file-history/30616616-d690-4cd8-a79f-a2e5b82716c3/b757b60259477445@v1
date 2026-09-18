@@ -1,0 +1,104 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    # perf/** is deliberately absent: perf branches publish through
+    # build-perf.yml (manual, perf-* tags) so they never overwrite :dev and
+    # can be tested in parallel with the regular flow.
+    branches: [main, 'feature/**', 'fix/**', 'chore/**']
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - 'requirements.txt'
+      - 'Dockerfile.base'
+      - '.python-version'
+      # Relay service — build-relay.yml owns these.
+      - 'relay/**'
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+
+jobs:
+  build-and-push:
+    runs-on:
+      - codebuild-${{ vars.AWS_CODEBUILD_RUNNER_STANDARD }}-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate tags
+        id: tags
+        run: |
+          REPO="${{ env.ECR_REPOSITORY }}"
+          SHA_SHORT="$(echo ${{ github.sha }} | cut -c1-7)"
+          TAGS=""
+
+          # Every build gets a sha tag (immutable, enables promotion without rebuild)
+          TAGS="${REPO}:sha-${SHA_SHORT}"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # Release tag: v1.2.3 → version + latest
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAGS="${TAGS},${REPO}:${VERSION}"
+            TAGS="${TAGS},${REPO}:latest"
+          elif [ "$GITHUB_REF_NAME" = "main" ]; then
+            # Main branch: stg (rolling)
+            TAGS="${TAGS},${REPO}:stg"
+          else
+            # Feature/fix/chore branches: dev (rolling)
+            TAGS="${TAGS},${REPO}:dev"
+          fi
+
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ vars.AWS_ECR_BASE_REPOSITORY }}:latest
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.ECR_REPOSITORY }}:cache
+          cache-to: type=registry,ref=${{ env.ECR_REPOSITORY }}:cache,mode=max
+          provenance: false
+
+      - name: Build summary
+        run: |
+          REPO="${{ env.ECR_REPOSITORY }}"
+          SHA_SHORT="$(echo ${{ github.sha }} | cut -c1-7)"
+
+          echo "### Build Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **SHA tag** | \`sha-${SHA_SHORT}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **All tags** | \`${{ steps.tags.outputs.tags }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Branch** | \`${GITHUB_REF_NAME}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**To promote this build**, run the [Promote Image](../promote/promote.yml) workflow with:" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha-${SHA_SHORT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"

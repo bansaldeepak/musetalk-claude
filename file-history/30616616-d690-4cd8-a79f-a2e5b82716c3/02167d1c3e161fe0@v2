@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Provision S3 with everything a cold-start container needs:
+#   1. Model weights (4.2 GB — only the files the runtime loads)
+#   2. Avatar cache  (5.9 GB per avatar — runtime-only, no full_imgs/mask)
+#
+# Run from a machine that has the models + avatar cache on local disk
+# (the GPU box after at least one successful boot, or after download_weights.sh).
+#
+# Usage:
+#   S3_BUCKET=taiboli-dev-ml-weights bash scripts/sync_weights_to_s3.sh
+#
+# Options (env vars):
+#   S3_BUCKET        (required) — target bucket name
+#   MODELS_DIR       — local models dir   (default: /opt/models)
+#   AVATAR_CACHE_DIR — local avatar cache  (default: /app/results/v15/avatars)
+#   AVATAR_ID        — which avatar        (default: avator_1)
+#   AWS_REGION       — S3 region           (default: ap-south-2)
+#   SKIP_WEIGHTS     — set to 1 to skip model weights upload
+#   SKIP_AVATAR      — set to 1 to skip avatar cache upload
+#   DRY_RUN          — set to 1 for s5cmd --dry-run (shows what would transfer)
+set -Eeuo pipefail
+
+S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET=<bucket-name>}"
+MODELS_DIR="${MODELS_DIR:-/opt/models}"
+AVATAR_CACHE_DIR="${AVATAR_CACHE_DIR:-/app/results/v15/avatars}"
+AVATAR_ID="${AVATAR_ID:-avator_1}"
+AWS_REGION="${AWS_REGION:-ap-south-2}"
+DRY_RUN="${DRY_RUN:-}"
+
+S3_WEIGHTS="s3://${S3_BUCKET}/models"
+S3_AVATAR="s3://${S3_BUCKET}/avatar-cache-v2/${AVATAR_ID}"
+
+dry_flag=""
+[ -n "$DRY_RUN" ] && dry_flag="--dry-run"
+
+# Prefer s5cmd for speed; fall back to aws cli.
+if command -v s5cmd >/dev/null 2>&1; then
+  s3up() {
+    local src="$1" dst="$2"; shift 2
+    s5cmd $dry_flag --endpoint-url "https://s3.${AWS_REGION}.amazonaws.com" \
+      --numworkers 64 cp "$@" "${src}/*" "${dst}/"
+  }
+else
+  echo "[sync] WARNING: s5cmd not found — using aws s3 sync (3-4x slower)"
+  s3up() {
+    local src="$1" dst="$2"; shift 2
+    if [ -n "$DRY_RUN" ]; then
+      aws s3 sync "$src/" "$dst/" --region "$AWS_REGION" --dryrun "$@"
+    else
+      aws s3 sync "$src/" "$dst/" --region "$AWS_REGION" "$@"
+    fi
+  }
+fi
+
+# ── 1. Model weights ────────────────────────────────────────────────
+
+if [ "${SKIP_WEIGHTS:-}" = "1" ]; then
+  echo "[sync] Skipping model weights (SKIP_WEIGHTS=1)"
+else
+  # Verify the critical file exists locally.
+  if [ ! -f "$MODELS_DIR/musetalkV15/unet.safetensors" ]; then
+    # Try to convert from .pth if available.
+    if [ -f "$MODELS_DIR/musetalkV15/unet.pth" ]; then
+      echo "[sync] unet.safetensors missing — converting from unet.pth..."
+      python3 scripts/convert_unet_safetensors.py \
+        --model-path "$MODELS_DIR/musetalkV15/unet.pth"
+    else
+      echo "[sync] ERROR: neither unet.safetensors nor unet.pth found in $MODELS_DIR/musetalkV15/"
+      echo "[sync] Run download_weights.sh first, then convert with scripts/convert_unet_safetensors.py"
+      exit 1
+    fi
+  fi
+
+  # The required files — same list as docker-entrypoint.sh weights_present().
+  required=(
+    musetalkV15/musetalk.json
+    musetalkV15/unet.safetensors
+    dwpose/dw-ll_ucoco_384.pth
+    s3fd/s3fd.pth
+    face-parse-bisent/79999_iter.pth
+    face-parse-bisent/resnet18-5c106cde.pth
+    sd-vae/config.json
+    sd-vae/diffusion_pytorch_model.safetensors
+    whisper/config.json
+    whisper/pytorch_model.bin
+    whisper/preprocessor_config.json
+  )
+  missing=()
+  for f in "${required[@]}"; do
+    [ -s "$MODELS_DIR/$f" ] || missing+=("$f")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "[sync] ERROR: missing model files in $MODELS_DIR:"
+    printf '  %s\n' "${missing[@]}"
+    echo "[sync] Run download_weights.sh first."
+    exit 1
+  fi
+
+  echo "[sync] Uploading model weights: $MODELS_DIR -> $S3_WEIGHTS"
+  # Exclude the files the entrypoint also excludes — no point uploading 7.8 GB
+  # of dead weight.  Upload only what weights_present() requires.
+  s3up "$MODELS_DIR" "$S3_WEIGHTS" \
+    --exclude "*musetalk/*" \
+    --exclude "*unet.pth" \
+    --exclude "*syncnet/*" \
+    --exclude "*.cache/*" \
+    --exclude "*.huggingface/*" \
+    --exclude "*.incomplete"
+  echo "[sync] Model weights done."
+fi
+
+# ── 2. Avatar cache (runtime-only) ──────────────────────────────────
+
+if [ "${SKIP_AVATAR:-}" = "1" ]; then
+  echo "[sync] Skipping avatar cache (SKIP_AVATAR=1)"
+else
+  avatar_dir="$AVATAR_CACHE_DIR/$AVATAR_ID"
+  runtime_dir="$avatar_dir/runtime"
+
+  if [ ! -f "$runtime_dir/rgb_frames.npy" ]; then
+    echo "[sync] ERROR: runtime cache not found at $runtime_dir"
+    echo "[sync] Boot the server once with this avatar to generate the cache,"
+    echo "[sync] then re-run this script."
+    exit 1
+  fi
+
+  # Verify the key files exist.
+  required_avatar=(
+    avatar_info.json
+    coords.pkl
+    latents.pt
+    mask_coords.pkl
+    runtime/rgb_frames.npy
+    runtime/idle_frames.npy
+    runtime/base_part.npy
+    runtime/alpha.npy
+    runtime/meta.json
+  )
+  missing=()
+  for f in "${required_avatar[@]}"; do
+    [ -s "$avatar_dir/$f" ] || missing+=("$f")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "[sync] WARNING: some avatar cache files missing (will upload what exists):"
+    printf '  %s\n' "${missing[@]}"
+  fi
+
+  echo "[sync] Uploading avatar cache: $avatar_dir -> $S3_AVATAR"
+  # Upload only the files the entrypoint downloads — skip full_imgs/ and mask/
+  # which are the source PNGs (not needed when runtime/ cache exists).
+  s3up "$avatar_dir" "$S3_AVATAR" \
+    --exclude "*full_imgs/*" \
+    --exclude "*mask/*"
+  echo "[sync] Avatar cache done."
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────
+
+echo ""
+echo "[sync] ✅ S3 provisioning complete."
+echo ""
+echo "  Weights: $S3_WEIGHTS"
+echo "  Avatar:  $S3_AVATAR"
+echo ""
+echo "  Container env vars:"
+echo "    S3_WEIGHTS_URI=$S3_WEIGHTS"
+echo "    S3_AVATAR_CACHE_URI=s3://${S3_BUCKET}/avatar-cache"
+echo "    AVATAR_ID=$AVATAR_ID"
+echo "    AWS_REGION=$AWS_REGION"

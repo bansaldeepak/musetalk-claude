@@ -1,0 +1,30 @@
+# hadolint ignore=DL3006
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+
+RUN curl -fsSL https://hf.co/cli/install.sh | bash
+
+COPY . .
+
+RUN chmod +x docker-entrypoint.sh download_weights.sh && \
+    curl -sL https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz \
+    | tar xz -C /usr/local/bin s5cmd
+# Guard: the entrypoint falls back to the ~3x slower `aws s3 sync` when s5cmd
+# is missing, and would do so silently. Fail the image build instead.
+# (Proven red 2026-09-18: with the binary removed this step exits 127.)
+RUN s5cmd version
+
+ENV PATH="/root/.local/bin:/app/.venv/bin:$PATH"
+ENV FFMPEG_PATH=/usr/bin/ffmpeg
+ENV AVATAR_PORT=8000
+ENV TRANSFORMERS_NO_TF=1
+# .git is excluded from the build context, so quality_gate.py cannot ask git
+# which commit it is running; the workflows pass the sha in instead.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+EXPOSE ${AVATAR_PORT}
+
+ENTRYPOINT ["./docker-entrypoint.sh"]
+CMD ["--warmup_musetalk"]

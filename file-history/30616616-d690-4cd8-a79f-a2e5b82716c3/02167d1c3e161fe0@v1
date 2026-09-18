@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# One-time script: download weights from HuggingFace and upload to S3.
+# Usage: S3_BUCKET=your-bucket-name bash sync_weights_to_s3.sh
+set -Eeuo pipefail
+
+S3_BUCKET="${S3_BUCKET:?Set S3_BUCKET=your-bucket-name}"
+S3_PREFIX="${S3_PREFIX:-musetalk-weights/models}"
+LOCAL_DIR="${LOCAL_DIR:-./models}"
+
+echo "[sync] Downloading weights from HuggingFace to $LOCAL_DIR"
+
+mkdir -p "$LOCAL_DIR"/{musetalk,musetalkV15,syncnet,dwpose,s3fd,face-parse-bisent,sd-vae,whisper}
+
+hf download TMElyralab/MuseTalk \
+  --local-dir "$LOCAL_DIR" \
+  --include "musetalk/musetalk.json" "musetalk/pytorch_model.bin"
+
+hf download TMElyralab/MuseTalk \
+  --local-dir "$LOCAL_DIR" \
+  --include "musetalkV15/musetalk.json" "musetalkV15/unet.pth"
+
+hf download stabilityai/sd-vae-ft-mse \
+  --local-dir "$LOCAL_DIR/sd-vae" \
+  --include "config.json" "diffusion_pytorch_model.safetensors"
+
+hf download openai/whisper-tiny \
+  --local-dir "$LOCAL_DIR/whisper" \
+  --include "config.json" "pytorch_model.bin" "preprocessor_config.json"
+
+hf download yzd-v/DWPose \
+  --local-dir "$LOCAL_DIR/dwpose" \
+  --include "dw-ll_ucoco_384.pth"
+
+hf download ByteDance/LatentSync \
+  --local-dir "$LOCAL_DIR/syncnet" \
+  --include "latentsync_syncnet.pt"
+
+pip install gdown 2>/dev/null || true
+gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O "$LOCAL_DIR/face-parse-bisent/79999_iter.pth"
+curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
+  -o "$LOCAL_DIR/face-parse-bisent/resnet18-5c106cde.pth"
+
+# Download s3fd weights
+if [ ! -f "$LOCAL_DIR/s3fd/s3fd.pth" ]; then
+  echo "[sync] Note: s3fd.pth must be sourced manually or from your existing setup"
+fi
+
+echo "[sync] Uploading to s3://$S3_BUCKET/$S3_PREFIX"
+aws s3 sync "$LOCAL_DIR" "s3://$S3_BUCKET/$S3_PREFIX" \
+  --exclude ".huggingface/*" \
+  --exclude "*.incomplete"
+
+echo "[sync] Done. Weights available at: s3://$S3_BUCKET/$S3_PREFIX"
+echo "[sync] Set S3_WEIGHTS_URI=s3://$S3_BUCKET/$S3_PREFIX in your docker run command"

@@ -1,0 +1,694 @@
+#!/usr/bin/env python
+"""quality_gate.py — objective render-quality + speed gate for MuseTalk changes.
+
+Every performance change that touches the render path (model format, decoder,
+batch size, blending, idle cache layout, torch/CUDA upgrade, ONNX/TensorRT...)
+must be run through this before a human looks at it. The script can prove
+"not degraded" and quantify sharpness/stability/speed; it cannot prove "looks
+better" — that stays with the human eye, but the human now looks at the worst
+frames the script picked instead of a random minute of video.
+
+Modes
+-----
+  capture      Render a fixed, deterministic set of idle + talking frames with the
+               current code and save them (plus timing + environment) to a folder.
+  compare      Same as capture, then score the fresh frames against a saved
+               reference folder. Exit 0 = PASS/IDENTICAL, 2 = REVIEW, 1 = FAIL.
+  report       Score two existing capture folders. No GPU, no models — use it on
+               a laptop to re-examine results or to compute a cross-process
+               noise floor from two `capture` runs.
+  noise-floor  Capture twice in one process and score A vs B. Tells you how much
+               drift the pipeline has on its own (cudnn.benchmark, TF32...), so
+               "within noise" means something.
+
+The one-command flow (recommended)
+----------------------------------
+  check        First run on an avatar: records the baseline + noise floor into
+               the store and exits 0. Every later run: captures, compares
+               against that baseline, stores the run, prints the verdict.
+  accept       Promote a run to be the new baseline (old one goes to history/).
+
+  python quality_gate.py check --audio data/audio/eng.wav -- --avatar_id avator_1
+  python quality_gate.py accept --avatar avator_1            # after a PASS you agree with
+
+Add `--s3 s3://<env-bucket>/quality` to both and the store is mirrored, so a
+fresh instance pulls the baseline instead of recording a new one. The store
+defaults to /opt/dlami/nvme/quality on the GPU box (survives container
+restarts), else results/quality; override with QUALITY_STORE or --store.
+
+Everything after `--` is passed verbatim to main_server's own argument parser,
+so the engine is configured exactly like production (`--vae_decoder`,
+`--musetalk_batch_size`, `--avatar_id`, ...). Use the same flags for baseline
+and checks, or you are measuring the flag change too.
+
+Verdict rules (face region, which is all the model changes)
+------------------------------------------------------------
+  IDENTICAL  every frame bit-identical to the reference
+  PASS       min face PSNR >= 40 dB and mean face SSIM >= 0.98, no flicker or
+             sharpness regression, same face geometry — invisible difference
+  REVIEW     min face PSNR in [32, 40) or SSIM in [0.95, 0.98) — may be visible
+             under scrutiny; open worst_frames.png and decide
+  FAIL       min face PSNR < 32 dB, SSIM < 0.95, flicker up > 25 %, sharpness
+             down > 15 %, or geometry/frame-count mismatch
+
+A recorded noise floor (`--noise-floor noise/compare.json`) can only *relax*
+the PASS bar (to floor - 1 dB), never tighten it. Thresholds are in THRESH.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+
+DEFAULT_TALK_FRAMES = 150   # 6 s of speech at 25 fps
+DEFAULT_IDLE_FRAMES = 100   # evenly spaced across the idle cycle
+AUDIO_SR = 16000
+
+THRESH = {
+    "pass_psnr": 40.0,      # dB, min over frames, face region
+    "review_psnr": 32.0,    # below this = FAIL
+    "pass_ssim": 0.98,      # mean over frames, face region
+    "fail_ssim": 0.95,
+    "flicker_ratio": 1.25,  # candidate / reference temporal diff in face region
+    "sharp_ratio": 0.85,    # candidate / reference Laplacian variance in face region
+}
+
+Box = Optional[Tuple[int, int, int, int]]  # (y1, y2, x1, x2) in output-frame coords
+
+
+# --------------------------------------------------------------------------- metrics
+def psnr(a: np.ndarray, b: np.ndarray) -> float:
+    mse = float(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2))
+    if mse == 0.0:
+        return float("inf")
+    return 20.0 * math.log10(255.0 / math.sqrt(mse))
+
+
+def _gray(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    return img.astype(np.float64)
+
+
+def ssim(a: np.ndarray, b: np.ndarray) -> float:
+    """Wang et al. SSIM on grayscale, 11x11 Gaussian window, sigma 1.5."""
+    ga, gb = _gray(a), _gray(b)
+    if ga.shape[0] < 11 or ga.shape[1] < 11:
+        return 1.0 if np.array_equal(ga, gb) else 0.0
+    c1, c2 = (0.01 * 255) ** 2, (0.03 * 255) ** 2
+    blur = lambda x: cv2.GaussianBlur(x, (11, 11), 1.5)  # noqa: E731
+    mu_a, mu_b = blur(ga), blur(gb)
+    s_a = blur(ga * ga) - mu_a * mu_a
+    s_b = blur(gb * gb) - mu_b * mu_b
+    s_ab = blur(ga * gb) - mu_a * mu_b
+    num = (2 * mu_a * mu_b + c1) * (2 * s_ab + c2)
+    den = (mu_a * mu_a + mu_b * mu_b + c1) * (s_a + s_b + c2)
+    return float(np.mean(num / den))
+
+
+def crop(frame: np.ndarray, box: Box) -> np.ndarray:
+    if box is None:
+        return frame
+    y1, y2, x1, x2 = box
+    return frame[y1:y2, x1:x2]
+
+
+def mouth_box(box: Box) -> Box:
+    if box is None:
+        return None
+    y1, y2, x1, x2 = box
+    return (y1 + (y2 - y1) // 2, y2, x1, x2)
+
+
+def sharpness(frame: np.ndarray, box: Box) -> float:
+    g = _gray(crop(frame, box))
+    if g.size == 0:
+        return 0.0
+    return float(cv2.Laplacian(g, cv2.CV_64F).var())
+
+
+def flicker(frames: np.ndarray, boxes: Sequence[Box]) -> float:
+    """Mean absolute frame-to-frame change inside the face box."""
+    if len(frames) < 2:
+        return 0.0
+    vals = []
+    for t in range(1, len(frames)):
+        a = crop(frames[t - 1], boxes[t]).astype(np.float64)
+        b = crop(frames[t], boxes[t]).astype(np.float64)
+        if a.shape == b.shape and a.size:
+            vals.append(float(np.mean(np.abs(a - b))))
+    return float(np.mean(vals)) if vals else 0.0
+
+
+def compare_frames(ref: np.ndarray, cand: np.ndarray, boxes: Sequence[Box]) -> Dict:
+    """Score candidate frames against reference frames of identical shape."""
+    n = len(ref)
+    full_psnr, face_psnr, mouth_psnr, face_ssim, identical = [], [], [], [], 0
+    for i in range(n):
+        r, c, b = ref[i], cand[i], boxes[i]
+        if np.array_equal(r, c):
+            identical += 1
+        full_psnr.append(psnr(r, c))
+        face_psnr.append(psnr(crop(r, b), crop(c, b)))
+        mouth_psnr.append(psnr(crop(r, mouth_box(b)), crop(c, mouth_box(b))))
+        face_ssim.append(ssim(crop(r, b), crop(c, b)))
+    ref_sharp = float(np.mean([sharpness(f, b) for f, b in zip(ref, boxes)])) if n else 0.0
+    cand_sharp = float(np.mean([sharpness(f, b) for f, b in zip(cand, boxes)])) if n else 0.0
+    ref_flick, cand_flick = flicker(ref, boxes), flicker(cand, boxes)
+    worst = sorted(range(n), key=lambda i: face_psnr[i])[:4]
+    return {
+        "frames": n,
+        "identical": identical,
+        "full_psnr_mean": _finite_mean(full_psnr),
+        "face_psnr_mean": _finite_mean(face_psnr),
+        "face_psnr_min": float(min(face_psnr)) if face_psnr else float("inf"),
+        "mouth_psnr_min": float(min(mouth_psnr)) if mouth_psnr else float("inf"),
+        "face_ssim_mean": float(np.mean(face_ssim)) if face_ssim else 1.0,
+        "face_ssim_min": float(min(face_ssim)) if face_ssim else 1.0,
+        "sharpness_ref": ref_sharp,
+        "sharpness_cand": cand_sharp,
+        "sharpness_ratio": (cand_sharp / ref_sharp) if ref_sharp > 0 else 1.0,
+        "flicker_ref": ref_flick,
+        "flicker_cand": cand_flick,
+        "flicker_ratio": (cand_flick / ref_flick) if ref_flick > 0 else (1.0 if cand_flick == 0 else float("inf")),
+        "worst_frames": worst,
+        "per_frame_face_psnr": [float(v) if math.isfinite(v) else None for v in face_psnr],
+    }
+
+
+def _finite_mean(vals: Sequence[float]) -> float:
+    finite = [v for v in vals if math.isfinite(v)]
+    if not finite:
+        return float("inf") if vals else 0.0
+    return float(np.mean(finite))
+
+
+def verdict(talk: Dict, idle: Dict, noise: Optional[Dict] = None,
+            thresh: Dict = THRESH) -> Tuple[str, List[str]]:
+    """Combine talking + idle scores into IDENTICAL / PASS / REVIEW / FAIL."""
+    pass_psnr = thresh["pass_psnr"]
+    if noise:
+        floor = min(noise.get("talk", {}).get("face_psnr_min", float("inf")),
+                    noise.get("idle", {}).get("face_psnr_min", float("inf")))
+        if math.isfinite(floor):
+            pass_psnr = min(pass_psnr, floor - 1.0)
+    reasons: List[str] = []
+    level = 0  # 0 identical, 1 pass, 2 review, 3 fail
+    for name, m in (("talk", talk), ("idle", idle)):
+        if m.get("geometry_mismatch"):
+            reasons.append(f"{name}: face geometry differs from reference")
+            level = max(level, 3)
+            continue
+        if m["identical"] == m["frames"]:
+            continue
+        level = max(level, 1)
+        if m["face_psnr_min"] < thresh["review_psnr"]:
+            reasons.append(f"{name}: min face PSNR {m['face_psnr_min']:.1f} dB < {thresh['review_psnr']}")
+            level = max(level, 3)
+        elif m["face_psnr_min"] < pass_psnr:
+            reasons.append(f"{name}: min face PSNR {m['face_psnr_min']:.1f} dB < {pass_psnr:.1f}")
+            level = max(level, 2)
+        if m["face_ssim_mean"] < thresh["fail_ssim"]:
+            reasons.append(f"{name}: mean face SSIM {m['face_ssim_mean']:.3f} < {thresh['fail_ssim']}")
+            level = max(level, 3)
+        elif m["face_ssim_mean"] < thresh["pass_ssim"]:
+            reasons.append(f"{name}: mean face SSIM {m['face_ssim_mean']:.3f} < {thresh['pass_ssim']}")
+            level = max(level, 2)
+        if m["flicker_ratio"] > thresh["flicker_ratio"]:
+            reasons.append(f"{name}: flicker x{m['flicker_ratio']:.2f} vs reference")
+            level = max(level, 3)
+        if m["sharpness_ratio"] < thresh["sharp_ratio"]:
+            reasons.append(f"{name}: sharpness x{m['sharpness_ratio']:.2f} vs reference")
+            level = max(level, 3)
+    return ["IDENTICAL", "PASS", "REVIEW", "FAIL"][level], reasons
+
+
+EXIT_CODE = {"IDENTICAL": 0, "PASS": 0, "REVIEW": 2, "FAIL": 1}
+
+
+# --------------------------------------------------------------------------- capture I/O
+def save_capture(out: str, idle: np.ndarray, idle_boxes: List[Box],
+                 talk: np.ndarray, talk_boxes: List[Box], meta: Dict) -> None:
+    os.makedirs(out, exist_ok=True)
+    np.save(os.path.join(out, "idle.npy"), idle)
+    np.save(os.path.join(out, "talk.npy"), talk)
+    with open(os.path.join(out, "boxes.json"), "w", encoding="utf-8") as f:
+        json.dump({"idle": idle_boxes, "talk": talk_boxes}, f)
+    with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+def load_capture(path: str) -> Tuple[np.ndarray, List[Box], np.ndarray, List[Box], Dict]:
+    idle = np.load(os.path.join(path, "idle.npy"), mmap_mode="r")
+    talk = np.load(os.path.join(path, "talk.npy"), mmap_mode="r")
+    with open(os.path.join(path, "boxes.json"), encoding="utf-8") as f:
+        boxes = json.load(f)
+    with open(os.path.join(path, "meta.json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    to_box = lambda b: tuple(b) if b else None  # noqa: E731
+    return idle, [to_box(b) for b in boxes["idle"]], talk, [to_box(b) for b in boxes["talk"]], meta
+
+
+def score_captures(ref_dir: str, cand_dir: str, out_dir: Optional[str] = None,
+                   noise: Optional[Dict] = None) -> Tuple[str, Dict]:
+    r_idle, r_ib, r_talk, r_tb, r_meta = load_capture(ref_dir)
+    c_idle, c_ib, c_talk, c_tb, c_meta = load_capture(cand_dir)
+    result: Dict = {"reference": ref_dir, "candidate": cand_dir,
+                    "reference_meta": r_meta, "candidate_meta": c_meta}
+    for name, (rf, rb, cf, cb) in {"talk": (r_talk, r_tb, c_talk, c_tb),
+                                   "idle": (r_idle, r_ib, c_idle, c_ib)}.items():
+        if rf.shape != cf.shape or rb != cb:
+            result[name] = {"geometry_mismatch": True, "frames": int(len(rf)), "identical": 0,
+                            "ref_shape": list(rf.shape), "cand_shape": list(cf.shape)}
+            continue
+        result[name] = compare_frames(rf, cf, rb)
+    label, reasons = verdict(result["talk"], result["idle"], noise)
+    result["verdict"], result["reasons"] = label, reasons
+    result["speed"] = _speed_delta(r_meta, c_meta)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "compare.json"), "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, default=str)
+        with open(os.path.join(out_dir, "compare.md"), "w", encoding="utf-8") as f:
+            f.write(render_markdown(result))
+        if not result["talk"].get("geometry_mismatch"):
+            write_contact_sheet(os.path.join(out_dir, "worst_frames.png"),
+                                r_talk, c_talk, r_tb, result["talk"]["worst_frames"])
+    return label, result
+
+
+def _speed_delta(r_meta: Dict, c_meta: Dict) -> Dict:
+    rt, ct = r_meta.get("timing", {}), c_meta.get("timing", {})
+    out = {}
+    for k in ("talk_ms_per_frame_p50", "talk_ms_per_frame_p95", "idle_ms_per_frame_p50"):
+        if k in rt and k in ct and rt[k]:
+            out[k] = {"ref": rt[k], "cand": ct[k], "change_pct": 100.0 * (ct[k] - rt[k]) / rt[k]}
+    return out
+
+
+def write_contact_sheet(path: str, ref: np.ndarray, cand: np.ndarray,
+                        boxes: Sequence[Box], indices: Sequence[int]) -> None:
+    """Worst frames side by side: reference | candidate | |diff| x4, cropped to the face."""
+    rows = []
+    for i in indices:
+        b = boxes[i]
+        r, c = crop(ref[i], b), crop(cand[i], b)
+        d = np.clip(np.abs(r.astype(np.int16) - c.astype(np.int16)) * 4, 0, 255).astype(np.uint8)
+        row = np.concatenate([r, c, d], axis=1)
+        cv2.putText(row, f"frame {i}  psnr {psnr(r, c):.1f} dB", (4, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+        rows.append(row)
+    if not rows:
+        return
+    w = max(r.shape[1] for r in rows)
+    rows = [np.pad(r, ((0, 0), (0, w - r.shape[1]), (0, 0))) for r in rows]
+    sheet = np.concatenate(rows, axis=0)
+    cv2.imwrite(path, cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
+
+
+def render_markdown(result: Dict) -> str:
+    lines = [f"# Quality gate: **{result['verdict']}**", ""]
+    for r in result.get("reasons", []):
+        lines.append(f"- {r}")
+    lines += ["", "| Set | Frames | Identical | Face PSNR min / mean | Mouth PSNR min | Face SSIM mean | Flicker x | Sharpness x |",
+              "|---|---|---|---|---|---|---|---|"]
+    for name in ("talk", "idle"):
+        m = result[name]
+        if m.get("geometry_mismatch"):
+            lines.append(f"| {name} | {m['frames']} | — | geometry mismatch {m['ref_shape']} vs {m['cand_shape']} | | | | |")
+            continue
+        lines.append(f"| {name} | {m['frames']} | {m['identical']} | {_fmt(m['face_psnr_min'])} / {_fmt(m['face_psnr_mean'])} dB "
+                     f"| {_fmt(m['mouth_psnr_min'])} dB | {m['face_ssim_mean']:.4f} | {m['flicker_ratio']:.2f} | {m['sharpness_ratio']:.2f} |")
+    if result.get("speed"):
+        lines += ["", "| Timing | Reference | Candidate | Change |", "|---|---|---|---|"]
+        for k, v in result["speed"].items():
+            lines.append(f"| {k} | {v['ref']:.2f} ms | {v['cand']:.2f} ms | {v['change_pct']:+.1f} % |")
+    rm, cm = result.get("reference_meta", {}), result.get("candidate_meta", {})
+    lines += ["", f"Reference: `{rm.get('git_sha', '?')}` torch {rm.get('torch', '?')} on {rm.get('gpu', '?')}",
+              f"Candidate: `{cm.get('git_sha', '?')}` torch {cm.get('torch', '?')} on {cm.get('gpu', '?')}", ""]
+    return "\n".join(lines)
+
+
+def _fmt(v: float) -> str:
+    return "inf" if not math.isfinite(v) else f"{v:.1f}"
+
+
+# --------------------------------------------------------------------------- capture (GPU)
+def _load_audio(path: Optional[str], seconds: float) -> Tuple[np.ndarray, str]:
+    if not path:
+        return None, "synthetic"
+    if not os.path.isfile(path):
+        raise SystemExit(f"audio not found: {path} — the image ships data/audio/eng.wav; "
+                         f"mount or copy another clip, or omit --audio for a synthetic tone")
+    try:
+        import librosa  # available in the GPU image (audio_processor imports it)
+        y, _ = librosa.load(path, sr=AUDIO_SR, mono=True)
+        audio = np.clip(y * 32767.0, -32768, 32767).astype(np.int16)
+    except Exception:
+        import wave
+        with wave.open(path, "rb") as w:
+            if w.getframerate() != AUDIO_SR or w.getnchannels() != 1 or w.getsampwidth() != 2:
+                raise SystemExit(f"{path}: need 16 kHz mono 16-bit wav when librosa is unavailable")
+            audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    audio = audio[: int(AUDIO_SR * seconds)]
+    digest = hashlib.sha256(audio.tobytes()).hexdigest()[:16]
+    return audio, f"{os.path.basename(path)}:{digest}"
+
+
+def _git_sha() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True,
+                                       stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return "unknown"
+
+
+def _box_for(engine, cycle_index: int) -> Box:
+    params = engine.avatar.blend_params_cycle[cycle_index % len(engine.avatar.blend_params_cycle)]
+    if not params.get("valid"):
+        return None
+    return tuple(int(v) for v in params["inter_coords"])
+
+
+def build_engine(server_args: Sequence[str]):
+    from main_server import build_arg_parser, config_from_args, MuseTalkEngine
+    parser = build_arg_parser()
+    sargs = parser.parse_args(list(server_args))
+    config = config_from_args(sargs)
+    if getattr(config, "blank_avatar", False):
+        raise SystemExit("quality_gate needs the real models; do not pass --blank_avatar")
+    engine = MuseTalkEngine(config)
+    engine.initialize()
+    ready = getattr(engine, "_render_service_ready", None)
+    if ready is not None and not ready.wait(timeout=180):
+        raise SystemExit("render service did not become ready in 180 s")
+    return engine, config
+
+
+def capture_with_engine(engine, config, audio_path: Optional[str], talk_frames: int,
+                        idle_frames: int) -> Tuple[np.ndarray, List[Box], np.ndarray, List[Box], Dict]:
+    import torch
+
+    n_cycle = len(engine.avatar.rgb_frame_list_cycle)
+    idle_idx = np.linspace(0, n_cycle - 1, min(idle_frames, n_cycle)).astype(int).tolist()
+    idle_times, idle_out, idle_boxes = [], [], []
+    for i in idle_idx:
+        t0 = time.perf_counter()
+        f = engine.idle_frame_rgb(i)
+        idle_times.append((time.perf_counter() - t0) * 1000.0)
+        idle_out.append(np.ascontiguousarray(f))
+        idle_boxes.append(_box_for(engine, i))
+
+    seconds = talk_frames / float(config.fps) + 1.0
+    audio, audio_id = _load_audio(audio_path, seconds)
+    if audio is None:
+        audio = engine._synthetic_warmup_audio(seconds)
+    prompts, feature_ms = engine._extract_warmup_prompts(audio)
+    prompts = prompts[:talk_frames]
+    if not prompts:
+        raise SystemExit("no prompts extracted from audio")
+    batch_size = max(1, config.musetalk_batch_size)
+    talk_out, talk_boxes, batch_ms = [], [], []
+    for off in range(0, len(prompts), batch_size):
+        batch = prompts[off: off + batch_size]
+        idx = [p[0] for p in batch]
+        pr = [p[1] for p in batch]
+        t0 = time.perf_counter()
+        frames = engine.submit_render(pr, idx)
+        dt = (time.perf_counter() - t0) * 1000.0
+        batch_ms.extend([dt / len(frames)] * len(frames))
+        for i, f in zip(idx, frames):
+            talk_out.append(np.ascontiguousarray(f))
+            talk_boxes.append(_box_for(engine, i))
+
+    meta = {
+        "git_sha": _git_sha(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "avatar_id": getattr(engine.avatar, "avatar_id", None),
+        "config": {k: getattr(config, k) for k in (
+            "musetalk_batch_size", "mouth_ramp_frames", "vae_decoder", "idle_mode",
+            "idle_silence_noise", "fps", "output_size", "compile_models", "version") if hasattr(config, k)},
+        "audio": audio_id,
+        "talk_frames": len(talk_out),
+        "idle_frames": len(idle_out),
+        "timing": {
+            "feature_ms_per_prompt": feature_ms / max(1, len(prompts)),
+            "talk_ms_per_frame_p50": float(np.percentile(batch_ms, 50)),
+            "talk_ms_per_frame_p95": float(np.percentile(batch_ms, 95)),
+            "talk_fps_equiv": 1000.0 / max(1e-6, float(np.mean(batch_ms))),
+            "idle_ms_per_frame_p50": float(np.percentile(idle_times, 50)),
+        },
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    return np.stack(idle_out), idle_boxes, np.stack(talk_out), talk_boxes, meta
+
+
+# --------------------------------------------------------------------------- store (one-command flow)
+# Layout under the store (default: /opt/dlami/nvme/quality on the GPU box,
+# else results/quality; override with QUALITY_STORE or --store):
+#
+#   <store>/<avatar_id>/baseline/          the accepted reference capture
+#   <store>/<avatar_id>/noise/             noise-floor capture "b" + compare.json
+#   <store>/<avatar_id>/runs/<ts>-<sha7>/  every `check` run, with its compare.*
+#   <store>/<avatar_id>/history/           previous baselines, moved aside by `accept`
+#
+# `check` records the baseline on first run and compares on every later run.
+# `accept` promotes a run to be the new baseline. `--s3 s3://bucket/prefix`
+# mirrors <store>/<avatar_id> to/from S3 so a fresh instance starts with the
+# baseline instead of recording a new one.
+
+def default_store() -> str:
+    env = os.environ.get("QUALITY_STORE")
+    if env:
+        return env
+    if os.path.isdir("/opt/dlami/nvme"):
+        return "/opt/dlami/nvme/quality"
+    return os.path.join("results", "quality")
+
+
+def store_paths(store: str, avatar: str) -> Dict[str, str]:
+    root = os.path.join(store, avatar)
+    return {
+        "root": root,
+        "baseline": os.path.join(root, "baseline"),
+        "noise": os.path.join(root, "noise"),
+        "runs": os.path.join(root, "runs"),
+        "history": os.path.join(root, "history"),
+    }
+
+
+def has_baseline(paths: Dict[str, str]) -> bool:
+    return os.path.isfile(os.path.join(paths["baseline"], "meta.json"))
+
+
+def s3_sync(src: str, dst: str) -> bool:
+    """Mirror a directory to/from S3 with s5cmd (fast) or aws cli. Returns success."""
+    import shutil
+    try:
+        if shutil.which("s5cmd"):
+            s = src.rstrip("/") + ("/*" if not src.startswith("s3://") else "/*")
+            cmd = ["s5cmd", "sync", s, dst.rstrip("/") + "/"]
+        elif shutil.which("aws"):
+            cmd = ["aws", "s3", "sync", src, dst, "--quiet"]
+        else:
+            print("s3 sync skipped: neither s5cmd nor aws cli on PATH", file=sys.stderr)
+            return False
+        subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"s3 sync failed ({e}); continuing with local store", file=sys.stderr)
+        return False
+
+
+def latest_run(paths: Dict[str, str]) -> Optional[str]:
+    runs = paths["runs"]
+    if not os.path.isdir(runs):
+        return None
+    cands = sorted(d for d in os.listdir(runs) if os.path.isfile(os.path.join(runs, d, "meta.json")))
+    return os.path.join(runs, cands[-1]) if cands else None
+
+
+def accept_run(paths: Dict[str, str], run_dir: str) -> str:
+    """Promote run_dir to baseline; move the old baseline into history. Returns history path or ''."""
+    import shutil
+    if not os.path.isfile(os.path.join(run_dir, "meta.json")):
+        raise SystemExit(f"{run_dir} is not a capture (no meta.json)")
+    moved = ""
+    if has_baseline(paths):
+        with open(os.path.join(paths["baseline"], "meta.json"), encoding="utf-8") as f:
+            old = json.load(f)
+        os.makedirs(paths["history"], exist_ok=True)
+        moved = os.path.join(paths["history"], f"baseline-{old.get('git_sha', 'unknown')}-{time.strftime('%Y%m%dT%H%M%S')}")
+        shutil.move(paths["baseline"], moved)
+    os.makedirs(os.path.dirname(paths["baseline"]), exist_ok=True)
+    shutil.copytree(run_dir, paths["baseline"])
+    # A new baseline invalidates the recorded noise floor's meaning only if the
+    # stack changed; keep it, but note the promotion in its folder.
+    with open(os.path.join(paths["baseline"], "ACCEPTED.txt"), "w", encoding="utf-8") as f:
+        f.write(f"accepted from {run_dir} at {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+    return moved
+
+
+def cmd_check(a, server_args: Sequence[str]) -> int:
+    store = a.store or default_store()
+    engine, config = build_engine(server_args)
+    avatar = a.avatar or getattr(engine.avatar, "avatar_id", None) or "avatar"
+    paths = store_paths(store, avatar)
+    s3_root = f"{a.s3.rstrip('/')}/{avatar}" if a.s3 else None
+
+    if s3_root and not has_baseline(paths):
+        os.makedirs(paths["root"], exist_ok=True)
+        s3_sync(s3_root, paths["root"])
+
+    if not has_baseline(paths):
+        cap = capture_with_engine(engine, config, a.audio, a.talk_frames, a.idle_frames)
+        save_capture(paths["baseline"], *cap)
+        print(f"BASELINE recorded: {paths['baseline']}  (git {cap[4]['git_sha']}, torch {cap[4]['torch']})")
+        print(json.dumps(cap[4]["timing"], indent=2))
+        if not a.skip_noise:
+            cap_b = capture_with_engine(engine, config, a.audio, a.talk_frames, a.idle_frames)
+            b_dir = os.path.join(paths["noise"], "b")
+            save_capture(b_dir, *cap_b)
+            _, res = score_captures(paths["baseline"], b_dir, paths["noise"])
+            print(f"NOISE FLOOR recorded: talk min face PSNR {_fmt(res['talk']['face_psnr_min'])} dB, "
+                  f"idle {_fmt(res['idle']['face_psnr_min'])} dB → {paths['noise']}/compare.json")
+        if s3_root:
+            s3_sync(paths["root"], s3_root)
+        print("Next `check` on this avatar compares against this baseline.")
+        return 0
+
+    sha7 = _git_sha()
+    run_dir = os.path.join(paths["runs"], f"{time.strftime('%Y%m%dT%H%M%S')}-{sha7}")
+    cap = capture_with_engine(engine, config, a.audio, a.talk_frames, a.idle_frames)
+    save_capture(run_dir, *cap)
+    noise_json = os.path.join(paths["noise"], "compare.json")
+    noise = _load_json(noise_json) if os.path.isfile(noise_json) else None
+    label, result = score_captures(paths["baseline"], run_dir, run_dir, noise)
+    print(render_markdown(result))
+    print(f"Run stored: {run_dir}")
+    print(f"Worst frames: {os.path.join(run_dir, 'worst_frames.png')}")
+    if label in ("PASS", "IDENTICAL"):
+        print(f"To adopt as the new baseline:  python quality_gate.py accept --avatar {avatar} --run {run_dir}"
+              + (f" --s3 {a.s3}" if a.s3 else ""))
+    if s3_root:
+        s3_sync(paths["root"], s3_root)
+    return EXIT_CODE[label]
+
+
+def cmd_accept(a) -> int:
+    store = a.store or default_store()
+    paths = store_paths(store, a.avatar)
+    run_dir = a.run or latest_run(paths)
+    if not run_dir:
+        raise SystemExit(f"no runs under {paths['runs']}; pass --run")
+    moved = accept_run(paths, run_dir)
+    print(f"baseline is now {paths['baseline']} (from {run_dir})")
+    if moved:
+        print(f"previous baseline moved to {moved}")
+    if a.s3:
+        s3_sync(paths["root"], f"{a.s3.rstrip('/')}/{a.avatar}")
+    return 0
+
+
+# --------------------------------------------------------------------------- CLI
+def _split_args(argv: Sequence[str]) -> Tuple[List[str], List[str]]:
+    if "--" in argv:
+        i = list(argv).index("--")
+        return list(argv[:i]), list(argv[i + 1:])
+    return list(argv), []
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    own, server_args = _split_args(argv)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="mode", required=True)
+
+    def common(sp):
+        sp.add_argument("--out", required=True, help="folder to write frames + meta (+ compare results)")
+        sp.add_argument("--audio", default=None, help="wav for the talking set; default = synthetic tone")
+        sp.add_argument("--talk-frames", type=int, default=DEFAULT_TALK_FRAMES)
+        sp.add_argument("--idle-frames", type=int, default=DEFAULT_IDLE_FRAMES)
+
+    def store_opts(sp):
+        sp.add_argument("--store", default=None, help=f"quality store dir (default: {default_store()})")
+        sp.add_argument("--avatar", default=None, help="avatar id (default: the engine's avatar)")
+        sp.add_argument("--s3", default=None, help="s3://bucket/prefix to mirror the store (pull baseline, push results)")
+
+    sp = sub.add_parser("check", help="one command: record baseline on first run, compare on later runs")
+    sp.add_argument("--audio", default=None, help="wav for the talking set; default = synthetic tone")
+    sp.add_argument("--talk-frames", type=int, default=DEFAULT_TALK_FRAMES)
+    sp.add_argument("--idle-frames", type=int, default=DEFAULT_IDLE_FRAMES)
+    sp.add_argument("--skip-noise", action="store_true", help="do not record the noise floor with the baseline")
+    store_opts(sp)
+    sp = sub.add_parser("accept", help="promote a check run to be the new baseline (no GPU)")
+    sp.add_argument("--run", default=None, help="run dir to accept (default: latest)")
+    store_opts(sp)
+
+    common(sub.add_parser("capture"))
+    sp = sub.add_parser("compare"); common(sp)
+    sp.add_argument("--ref", required=True)
+    sp.add_argument("--noise-floor", default=None, help="compare.json from a noise-floor run")
+    sp = sub.add_parser("noise-floor"); common(sp)
+    sp = sub.add_parser("report")
+    sp.add_argument("--ref", required=True)
+    sp.add_argument("--cand", required=True)
+    sp.add_argument("--out", default=None)
+    sp.add_argument("--noise-floor", default=None)
+    a = p.parse_args(own)
+
+    if a.mode == "check":
+        return cmd_check(a, server_args)
+    if a.mode == "accept":
+        if not a.avatar:
+            p.error("accept needs --avatar")
+        return cmd_accept(a)
+    if a.mode == "report":
+        noise = _load_json(a.noise_floor) if a.noise_floor else None
+        label, result = score_captures(a.ref, a.cand, a.out, noise)
+        print(render_markdown(result))
+        return EXIT_CODE[label]
+
+    engine, config = build_engine(server_args)
+    if a.mode == "noise-floor":
+        cap_a = capture_with_engine(engine, config, a.audio, a.talk_frames, a.idle_frames)
+        cap_b = capture_with_engine(engine, config, a.audio, a.talk_frames, a.idle_frames)
+        save_capture(os.path.join(a.out, "a"), *cap_a)
+        save_capture(os.path.join(a.out, "b"), *cap_b)
+        label, result = score_captures(os.path.join(a.out, "a"), os.path.join(a.out, "b"), a.out)
+        print(render_markdown(result))
+        print("Noise floor recorded. Pass this folder's compare.json as --noise-floor to `compare`.")
+        return 0
+
+    cap = capture_with_engine(engine, config, a.audio, a.talk_frames, a.idle_frames)
+    save_capture(a.out, *cap)
+    print(f"captured {cap[4]['talk_frames']} talking + {cap[4]['idle_frames']} idle frames to {a.out}")
+    print(json.dumps(cap[4]["timing"], indent=2))
+    if a.mode == "capture":
+        return 0
+    noise = _load_json(a.noise_floor) if a.noise_floor else None
+    label, result = score_captures(a.ref, a.out, a.out, noise)
+    print(render_markdown(result))
+    return EXIT_CODE[label]
+
+
+def _load_json(path: str) -> Dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

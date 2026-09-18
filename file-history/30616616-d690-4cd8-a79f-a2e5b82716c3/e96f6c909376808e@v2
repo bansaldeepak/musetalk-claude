@@ -1,0 +1,78 @@
+#!/bin/bash
+# Download model weights from HuggingFace.
+#
+# Called by docker-entrypoint.sh when S3_WEIGHTS_URI is unset or the S3
+# download is incomplete.  Also usable standalone for initial provisioning.
+#
+# Produces the same file set that weights_present() in docker-entrypoint.sh
+# checks — in particular unet.safetensors (converted from the .pth that
+# HuggingFace hosts).
+set -Eeuo pipefail
+
+CheckpointsDir="${MODELS_DIR:-models}"
+
+mkdir -p "$CheckpointsDir"/{musetalkV15,dwpose,face-parse-bisent,s3fd,sd-vae,whisper}
+
+# ── UNet V1.5 (safetensors) ─────────────────────────────────────────
+# HuggingFace only hosts the .pth; we convert to .safetensors for faster
+# mmap loading.  Skip the download if safetensors already exists.
+if [ -s "$CheckpointsDir/musetalkV15/unet.safetensors" ]; then
+  echo "unet.safetensors already present, skipping."
+else
+  hf download TMElyralab/MuseTalk \
+    --local-dir "$CheckpointsDir" \
+    --include "musetalkV15/musetalk.json" "musetalkV15/unet.pth"
+
+  echo "Converting unet.pth → unet.safetensors..."
+  python3 scripts/convert_unet_safetensors.py \
+    --model-path "$CheckpointsDir/musetalkV15/unet.pth"
+
+  if [ ! -s "$CheckpointsDir/musetalkV15/unet.safetensors" ]; then
+    echo "ERROR: conversion failed — unet.safetensors not produced" >&2
+    exit 1
+  fi
+  # The .pth is no longer needed (3.2 GB); the UNet loader prefers
+  # .safetensors when both exist.  Keep it only if disk space isn't tight.
+fi
+
+# ── SD VAE ───────────────────────────────────────────────────────────
+hf download stabilityai/sd-vae-ft-mse \
+  --local-dir "$CheckpointsDir/sd-vae" \
+  --include "config.json" "diffusion_pytorch_model.safetensors"
+
+# ── Whisper ──────────────────────────────────────────────────────────
+hf download openai/whisper-tiny \
+  --local-dir "$CheckpointsDir/whisper" \
+  --include "config.json" "pytorch_model.bin" "preprocessor_config.json"
+
+# ── DWPose ───────────────────────────────────────────────────────────
+hf download yzd-v/DWPose \
+  --local-dir "$CheckpointsDir/dwpose" \
+  --include "dw-ll_ucoco_384.pth"
+
+# ── Face Parse BiSeNet ───────────────────────────────────────────────
+if [ -s "$CheckpointsDir/face-parse-bisent/79999_iter.pth" ]; then
+  echo "face-parse-bisent/79999_iter.pth already present, skipping."
+else
+  pip install gdown 2>/dev/null || true
+  gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 \
+    -O "$CheckpointsDir/face-parse-bisent/79999_iter.pth"
+fi
+
+if [ ! -s "$CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth" ]; then
+  curl -fL https://download.pytorch.org/models/resnet18-5c106cde.pth \
+    -o "$CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth"
+fi
+
+# ── S3FD face detector ───────────────────────────────────────────────
+if [ -s "$CheckpointsDir/s3fd/s3fd.pth" ]; then
+  echo "s3fd weights already present, skipping."
+elif curl -fL https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth \
+  -o "$CheckpointsDir/s3fd/s3fd.pth.tmp"; then
+  mv "$CheckpointsDir/s3fd/s3fd.pth.tmp" "$CheckpointsDir/s3fd/s3fd.pth"
+else
+  rm -f "$CheckpointsDir/s3fd/s3fd.pth.tmp"
+  echo "WARNING: s3fd download failed; sfd_detector.py will fall back to torch.hub." >&2
+fi
+
+echo "All weights downloaded successfully."

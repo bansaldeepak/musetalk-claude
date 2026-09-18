@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MODELS_DIR="${MODELS_DIR:-/app/models}"
+S3_WEIGHTS_URI="${S3_WEIGHTS_URI:-}"
+S3_AVATAR_CACHE_URI="${S3_AVATAR_CACHE_URI:-}"
+AVATAR_CACHE_DIR="${AVATAR_CACHE_DIR:-/app/results/v15/avatars}"
+
+weights_present() {
+  local required=(
+    musetalkV15/musetalk.json
+    musetalkV15/unet.safetensors
+    dwpose/dw-ll_ucoco_384.pth
+    s3fd/s3fd.pth
+    face-parse-bisent/79999_iter.pth
+    face-parse-bisent/resnet18-5c106cde.pth
+    sd-vae/config.json
+    sd-vae/diffusion_pytorch_model.safetensors
+    whisper/config.json
+    whisper/pytorch_model.bin
+    whisper/preprocessor_config.json
+  )
+
+  for file in "${required[@]}"; do
+    [ -s "$MODELS_DIR/$file" ] || return 1
+  done
+}
+
+blank_mode() {
+  case "$(printf '%s' "${AVATAR_BLANK_MODE:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  # Also honour the CLI flag, so `docker run <image> --blank_avatar` works on an
+  # image that wasn't built with the env baked in.
+  local arg
+  for arg in "$@"; do
+    [ "$arg" = "--blank_avatar" ] && return 0
+  done
+  return 1
+}
+
+# One line per payload saying which downloader ran and how long it took, so a
+# slow boot can be attributed from the log alone (review 2026-09-16 §2.1).
+# `cp`, not `sync`: in s5cmd 2.2.2 `sync` exits 0 on every error (missing
+# prefix, 400, access denied — verified 2026-09-18) while `cp` exits 1, and
+# these are only called when the destination is empty, so sync's LIST pass
+# bought nothing. Callers decide what a failure means; see the checks below.
+s3_sync() {
+  local src="$1" dst="$2"
+  shift 2
+  local region="${AWS_REGION:-ap-south-2}"
+  # `&& rc=0 || rc=$?` keeps errexit from killing the script before the log line.
+  local tool t0 rc
+  t0=$(date +%s)
+  if command -v s5cmd >/dev/null 2>&1; then
+    tool="s5cmd cp"
+    s5cmd --endpoint-url "https://s3.${region}.amazonaws.com" --numworkers 64 \
+      cp "$@" "${src}/*" "$dst/" && rc=0 || rc=$?
+  else
+    tool="aws s3 sync (SLOW PATH: s5cmd missing from image)"
+    echo "[entrypoint] WARNING: s5cmd not found — falling back to aws s3 sync"
+    aws s3 sync "$src/" "$dst/" --region "$region" --quiet "$@" && rc=0 || rc=$?
+  fi
+  echo "[entrypoint] ${tool}: ${src} -> ${dst} in $(($(date +%s) - t0))s (exit ${rc})"
+  return "$rc"
+}
+
+hf_fallback() {
+  # Fall back to HuggingFace download when S3 is unavailable or incomplete.
+  if [ -x /app/download_weights.sh ]; then
+    echo "[entrypoint] Downloading weights from HuggingFace..."
+    cd /app && MODELS_DIR="$MODELS_DIR" bash download_weights.sh
+  else
+    echo "[entrypoint] ERROR: download_weights.sh not found and weights are missing"
+    exit 1
+  fi
+}
+
+if blank_mode "$@"; then
+  echo "[entrypoint] Blank-avatar mode: skipping model weight provisioning"
+else
+  need_weights=false
+  need_avatar=false
+
+  if weights_present; then
+    echo "[entrypoint] Model weights found at $MODELS_DIR"
+  elif [ -n "$S3_WEIGHTS_URI" ]; then
+    need_weights=true
+  else
+    echo "[entrypoint] No S3_WEIGHTS_URI set — falling back to HuggingFace download"
+    hf_fallback
+    if ! weights_present; then
+      echo "[entrypoint] ERROR: weights still missing after HuggingFace download"
+      ls -la "$MODELS_DIR"/ 2>/dev/null || echo "[entrypoint] ($MODELS_DIR does not exist)"
+      exit 1
+    fi
+    echo "[entrypoint] All weights verified (HuggingFace)"
+  fi
+
+  if [ -n "$S3_AVATAR_CACHE_URI" ]; then
+    avatar_id="${AVATAR_ID:-avator_1}"
+    cache_dir="$AVATAR_CACHE_DIR/$avatar_id"
+    runtime_dir="$cache_dir/runtime"
+    if [ ! -f "$runtime_dir/rgb_frames.npy" ]; then
+      need_avatar=true
+    else
+      echo "[entrypoint] Avatar cache present at $cache_dir"
+    fi
+  fi
+
+  # Exclude unused model files from S3 sync: old v1 model dir, duplicate .pth
+  # when .safetensors exists, syncnet (not used at runtime), HF cache metadata.
+  # No leading "*/": `s5cmd cp` matches --exclude against the key relative to
+  # the wildcard (musetalk/x), `sync` against the full key (models/musetalk/x).
+  # "*name/*" matches both; "*/name/*" silently matched nothing under cp and
+  # pulled 8.8 GB instead of 4.2 GB (2026-09-18). Check with `s5cmd --dry-run`.
+  MODEL_EXCLUDES=(
+    --exclude "*musetalk/*"
+    --exclude "*unet.pth"
+    --exclude "*syncnet/*"
+    --exclude "*.cache/*"
+    --exclude "*.sync-complete"
+  )
+
+  # Download weights and avatar cache in parallel when both are needed.
+  if $need_weights && $need_avatar; then
+    echo "[entrypoint] Downloading weights + avatar cache from S3 (parallel)..."
+    t_start=$(date +%s)
+    # A failed download is handled by the presence checks below (weights →
+    # HuggingFace fallback, avatar → loud warning), so tolerate the exit code.
+    s3_sync "$S3_WEIGHTS_URI" "$MODELS_DIR" "${MODEL_EXCLUDES[@]}" &
+    pid_w=$!
+    mkdir -p "$runtime_dir"
+    s3_sync "${S3_AVATAR_CACHE_URI}-v2/${avatar_id}" "$cache_dir" &
+    pid_a=$!
+    wait $pid_w || true; wait $pid_a || true
+    echo "[entrypoint] Both downloads complete in $(($(date +%s) - t_start))s"
+  elif $need_weights; then
+    echo "[entrypoint] Downloading weights from S3..."
+    t_start=$(date +%s)
+    s3_sync "$S3_WEIGHTS_URI" "$MODELS_DIR" "${MODEL_EXCLUDES[@]}" || true
+    echo "[entrypoint] Weights downloaded in $(($(date +%s) - t_start))s"
+  elif $need_avatar; then
+    echo "[entrypoint] Avatar cache missing — downloading from S3..."
+    t_start=$(date +%s)
+    mkdir -p "$runtime_dir"
+    s3_sync "${S3_AVATAR_CACHE_URI}-v2/${avatar_id}" "$cache_dir" || true
+    echo "[entrypoint] Avatar cache downloaded in $(($(date +%s) - t_start))s"
+  fi
+
+  # The avatar cache had no check after download: a failed pull was silent and
+  # main_server re-prepared the avatar from video (minutes). Say so loudly.
+  if $need_avatar && [ ! -f "$runtime_dir/rgb_frames.npy" ]; then
+    echo "[entrypoint] ERROR: avatar cache for ${avatar_id} is incomplete after S3 download" \
+         "(${S3_AVATAR_CACHE_URI}-v2/${avatar_id}); main_server will re-prepare it from video, which takes minutes"
+  fi
+
+  # If S3 download was attempted but incomplete, fall back to HuggingFace.
+  if $need_weights && ! weights_present; then
+    echo "[entrypoint] S3 sync incomplete — falling back to HuggingFace download"
+    hf_fallback
+    if ! weights_present; then
+      echo "[entrypoint] ERROR: weights still missing after all download attempts"
+      ls -la "$MODELS_DIR"/ 2>/dev/null || echo "[entrypoint] ($MODELS_DIR does not exist)"
+      exit 1
+    fi
+    # Upload to S3 for next boot if bucket is configured but was empty.
+    echo "[entrypoint] Syncing weights back to S3 for future boots"
+    aws s3 sync "$MODELS_DIR" "$S3_WEIGHTS_URI" --quiet &
+  fi
+fi
+
+# Pre-warm model files into page cache in the BACKGROUND while Python starts.
+# Python spends ~4-9s importing before it touches model files. The background
+# reads overlap with that import time, so by the time torch.load runs the data
+# is already in page cache (memory speed) instead of waiting for EBS.
+if ! blank_mode "$@"; then
+  echo "[entrypoint] Pre-warming model files into page cache (background)..."
+  (
+    for f in \
+      "$MODELS_DIR/musetalkV15/unet.safetensors" \
+      "$MODELS_DIR/sd-vae/diffusion_pytorch_model.safetensors" \
+      "$MODELS_DIR/whisper/pytorch_model.bin"; do
+      [ -f "$f" ] && cat "$f" > /dev/null &
+    done
+    wait
+    echo "[entrypoint] Page cache warm"
+  ) &
+fi
+
+echo "[entrypoint] Starting main_server.py $*"
+exec python main_server.py "$@"

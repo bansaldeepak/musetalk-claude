@@ -1,5 +1,5 @@
 {
-  "model": "claude-fable-5-1[1m]",
+  "model": "arn:aws:bedrock:ap-south-1:851725484080:inference-profile/global.anthropic.claude-opus-4-6-v1",
   "tui": "fullscreen",
   "theme": "auto"
 }

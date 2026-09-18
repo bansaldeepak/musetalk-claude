@@ -1,0 +1,201 @@
+name: Build Perf Image
+
+# Perf-branch builds live in their own tag namespace so they can be run and
+# compared on a GPU box in parallel with the regular dev/stg/prod flow, and can
+# never be promoted by accident:
+#
+#   <AWS_ECR_REPOSITORY>:perf-<slug>              rolling — latest build of that branch
+#   <AWS_ECR_REPOSITORY>:perf-<slug>-<sha7>       immutable — what you actually tested
+#   <AWS_ECR_BASE_REPOSITORY>:perf-<slug>         only when build_base=true
+#
+# where <slug> is the branch name without the perf/ prefix (perf/s3-avatar-cache
+# → s3-avatar-cache). This workflow never writes sha-<7hex>, dev, stg or latest,
+# so promote.yml refuses its output by construction, and the regular workflows
+# no longer trigger on perf/** branches at all. To adopt a verified perf build,
+# merge the branch to main and let the normal flow publish it.
+#
+# Triggers:
+#   - push to perf/** that touches code (docs, tests and the plan are ignored):
+#     builds the app layer on the production base, publishes perf-* tags only.
+#     Add "[skip ci]" to a commit message to suppress.
+#   - workflow_dispatch: same, plus the build_base option. Tick it when the
+#     branch changes requirements.txt or Dockerfile.base (for example a torch
+#     upgrade); the perf base never touches the production base :latest.
+#
+# A newer push to the same branch cancels an in-flight perf build.
+#
+# On the GPU box, the summary prints the docker run line. Run quality_gate.py
+# inside that container to compare it against the stored baseline.
+
+on:
+  push:
+    branches: ['perf/**']
+    paths-ignore:
+      - '**.md'
+      - 'documentation/**'
+      - 'tests/**'
+      - 'relay/tests/**'
+      - '.github/workflows/build-relay.yml'
+      - '.github/workflows/promote.yml'
+  workflow_dispatch:
+    inputs:
+      build_base:
+        description: 'Also rebuild Dockerfile.base for this branch (only needed when requirements.txt / Dockerfile.base changed)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+  ECR_BASE_REPOSITORY: ${{ vars.AWS_ECR_BASE_REPOSITORY }}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.s.outputs.slug }}
+      sha7: ${{ steps.s.outputs.sha7 }}
+    steps:
+      - name: Derive tag slug from branch
+        id: s
+        run: |
+          SLUG="$(printf '%s' "${GITHUB_REF_NAME}" | sed -E 's#^perf/##; s#[^A-Za-z0-9._-]+#-#g' | cut -c1-40)"
+          if [ -z "$SLUG" ]; then echo "::error::empty slug from ref ${GITHUB_REF_NAME}"; exit 1; fi
+          echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
+          echo "sha7=$(printf '%s' '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+  build-base:
+    # Only on a manual run with the box ticked; push-triggered builds always
+    # use the production base.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_base }}
+    needs: resolve
+    runs-on:
+      - codebuild-${{ vars.AWS_CODEBUILD_RUNNER_BASE }}-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push perf base image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.base
+          push: true
+          tags: |
+            ${{ env.ECR_BASE_REPOSITORY }}:perf-${{ needs.resolve.outputs.slug }}
+            ${{ env.ECR_BASE_REPOSITORY }}:perf-${{ needs.resolve.outputs.slug }}-${{ needs.resolve.outputs.sha7 }}
+          # Read the production cache (most layers are shared) but write only to
+          # the perf cache so an experimental base never pollutes the main one.
+          cache-from: |
+            type=registry,ref=${{ env.ECR_BASE_REPOSITORY }}:perf-cache
+            type=registry,ref=${{ env.ECR_BASE_REPOSITORY }}:cache
+          cache-to: type=registry,ref=${{ env.ECR_BASE_REPOSITORY }}:perf-cache,mode=max
+          provenance: false
+
+  build-app:
+    needs: [resolve, build-base]
+    # Run whether build-base ran or was skipped; only a failed base stops us.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.build-base.result != 'failure' }}
+    runs-on:
+      - codebuild-${{ vars.AWS_CODEBUILD_RUNNER_STANDARD }}-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve base image and tags
+        id: tags
+        run: |
+          SLUG="${{ needs.resolve.outputs.slug }}"
+          SHA7="${{ needs.resolve.outputs.sha7 }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_base }}" = "true" ]; then
+            BASE="${{ env.ECR_BASE_REPOSITORY }}:perf-${SLUG}"
+          else
+            BASE="${{ env.ECR_BASE_REPOSITORY }}:latest"
+          fi
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "rolling=${{ env.ECR_REPOSITORY }}:perf-${SLUG}" >> "$GITHUB_OUTPUT"
+          echo "immutable=${{ env.ECR_REPOSITORY }}:perf-${SLUG}-${SHA7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push perf app image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ steps.tags.outputs.base }}
+            GIT_SHA=${{ needs.resolve.outputs.sha7 }}
+          tags: |
+            ${{ steps.tags.outputs.rolling }}
+            ${{ steps.tags.outputs.immutable }}
+          cache-from: |
+            type=registry,ref=${{ env.ECR_REPOSITORY }}:perf-cache
+            type=registry,ref=${{ env.ECR_REPOSITORY }}:cache
+          cache-to: type=registry,ref=${{ env.ECR_REPOSITORY }}:perf-cache,mode=max
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Perf Image Published (not promotable)"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Immutable** | \`${{ steps.tags.outputs.immutable }}\` |"
+            echo "| **Rolling** | \`${{ steps.tags.outputs.rolling }}\` |"
+            echo "| **Base** | \`${{ steps.tags.outputs.base }}\` |"
+            echo "| **Branch** | \`${GITHUB_REF_NAME}\` @ \`${{ github.sha }}\` |"
+            echo ""
+            echo "Run on the GPU box (same env file as the regular image):"
+            echo ""
+            echo '```bash'
+            echo "docker run -d --name perf-${{ needs.resolve.outputs.slug }} --gpus all -p 8001:8000 \\"
+            echo "  --env-file /path/to/.env -v /opt/dlami/nvme:/opt/dlami/nvme \\"
+            echo "  ${{ steps.tags.outputs.immutable }} --warmup_musetalk"
+            echo '```'
+            echo ""
+            echo "Then run the quality gate inside the container (records the baseline on the"
+            echo "first ever run for the avatar, compares on every later run):"
+            echo ""
+            echo '```bash'
+            echo "docker exec -w /app perf-${{ needs.resolve.outputs.slug }} python quality_gate.py check \\"
+            echo "  --audio data/audio/eng.wav --s3 s3://<env-bucket>/quality -- --avatar_id avator_1"
+            echo '```'
+            echo ""
+            echo "To adopt this build: merge the branch to main; the regular workflow publishes it."
+          } >> "$GITHUB_STEP_SUMMARY"

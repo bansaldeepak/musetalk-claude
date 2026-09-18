@@ -1,0 +1,410 @@
+# Performance — Status and Plan of Record
+
+> **Updated:** 2026-09-18 · **Branch:** `perf/s3-avatar-cache` @ `4a96788` + runner fix
+> **This is the only plan.** Everything else in this folder is either a *record*
+> of work done, a *design note* for one item here, or an *archived analysis*.
+> See §7 for which is which. When this page and another page disagree, this page
+> wins and the other page gets fixed.
+>
+> Inputs: [`ADVERSARIAL-REVIEW-2026-09-16.md`](./ADVERSARIAL-REVIEW-2026-09-16.md)
+> (findings), [`PERFORMANCE-COMPLETE.md`](./PERFORMANCE-COMPLETE.md) (what shipped),
+> [`CONSOLIDATED-TRUTH.md`](./CONSOLIDATED-TRUTH.md) (claims ledger), and the owner's
+> answers recorded in §0.
+
+---
+
+## 0. Decisions and facts from the owner (2026-09-16)
+
+| Topic | Decision / fact | Consequence |
+|---|---|---|
+| Boot path | Docker image + `docker-entrypoint.sh` (ECR). | The bind-mount `run_start.sh` path in `architecture/operations.md` is legacy; the entrypoint is the thing to get right (§4 P0.1, P0.2). |
+| Regions | India alpha → **ap-south-2** (Hyderabad). US users → **us-east-1**. | "Deploy to ap-south-1" is struck from the roadmap. The Ohio→India lag path in `rendering.md §11.13` no longer exists. TASK-020 (bitrate slow-start) is still worth one afternoon from an Indian wifi client against ap-south-2, because the 4 Mbps no-slow-start policy is unchanged. |
+| Why cold start matters | **Scale-out** (new GPU servers on demand) and **image updates**. | The number to optimise is *time from scale signal to serving*, not "container restart". §2 shows our 48s is a minority of that number. |
+| Goal | **GPU cost on production.** | Density per GPU and $/GPU-hour are the two levers. A cheaper GPU tier benchmark (§4 M3) is promoted; anything that only helps 1–2 sessions on L40S is demoted. |
+| Quality | **Must not degrade.** 30 fps wanted if it improves perceived quality. | TAESD is "measure only, expect reject". Every render-path change runs `quality_gate.py` (§5). 30 fps is an experiment with an honest unknown (§6). |
+| S3 | Per-env, per-region buckets; **write access** exists. | Entrypoint write-back is fine. Quality baselines and avatar caches can be published from any box (§5). |
+
+---
+
+## 1. Done — shipped and measured
+
+All on `main` unless marked. Measured on g6e.xlarge / L40S, production stack
+(torch 2.1.0 + cu121) unless marked *fork* (torch 2.11 + cu128, numbers do not
+transfer — see review §3.2).
+
+| Area | Change | Before → after | Record |
+|---|---|---|---|
+| Greeting | skip dead local realtime URL; parallel fetch + WS connect; persistent render service thread | 12.4 s → **774 ms** | PERFORMANCE-COMPLETE §2A, WARM-START-V1 |
+| Warm start | lazy DWPose/S3FD; safetensors UNet; `base_part.npy`; fewer warmup passes; page-cache prewarm; TF removed | 69 s → **14.3 s** | WARM-START-V1, backlog 02 |
+| Render loop | batch-1 pinning fix; warm all shapes 1..7 | 42 % windows over budget → **0 of 641**, p95 18.8 ms | rendering.md §(a)(b) |
+| Cold start | S3 avatar cache; s5cmd; 12 GB → 4.2 GB weights; NVMe target *(this branch)* | 7 min → **29 s to listening, 33 s fully warmed** *(committed image, measured 2026-09-18: 5.9 GB avatar cache from S3 in 8 s; weights already on the box)* | COLD-START-OPTIMIZATION §5 |
+| Image | multi-stage build, build-only deps split | ~10 GB → **~7 GB** | PR #48 |
+| Diagnosis | CPU is 7 % busy; GPU 16.6 ms/frame at batch 4; user lag was off the render path | — | rendering.md §(c), §11.13 |
+| Fork results *(not ported)* | S3FD 0.5× (1.87× prep), batch VAE encode (1.5×), mask cache — all *prep-time* wins | — | TASK-008/009/010 |
+
+**Numbers that matter today**
+
+| Metric | Value | Source |
+|---|---|---|
+| Per-frame render, batch 4, L40S | 16.6 ms (p95 18.8) | rendering.md |
+| CPU blend per frame (production path) | 0.79 ms | rendering.md §(c) |
+| Greeting on a running server | 774 ms | WARM-START-V1 |
+| Container warm start (NVMe data present) | 20 s to `/health` (re-measured 2026-09-18, committed image) | COLD-START §5 |
+| Entrypoint cold start (avatar cache S3→NVMe + Python) | 29 s to listening, 33 s fully warmed — weights already local (measured 2026-09-18, committed image). Weights-from-S3 case not yet measured on the committed image | COLD-START §5 |
+| Download payload | ~10 GB (4.2 models + 5.9 avatar) | COLD-START §2 |
+| Network burst | ~3.5 GB at ~700 MB/s, then ~270 MB/s | COLD-START §3 |
+
+---
+
+## 2. What scale-out cold start actually is
+
+Our 48s is the tail of a longer chain. Estimates, to be measured once in each region:
+
+| Step | Typical | Lever |
+|---|---|---|
+| EC2 launch of a g6e instance to SSH-ready | 60–120 s | ASG **warm pool** (stopped instances resume in ~30–60 s) |
+| `docker pull` of a ~7 GB image from same-region ECR | 40–120 s | **AMI with the image pre-pulled**; smaller image (prep/runtime split) |
+| Entrypoint: models + avatar cache from S3 | 28 s → ~5–13 s after §4 Q5/Q6/M1 | shrink payload under the 3.5 GB burst |
+| Python start to listening | 15–20 s | Q3, Q4, later ONNX |
+| **Total today** | **~3–5 min** | |
+| **With warm pool + baked AMI + shrunk payload** | **~60–90 s** | |
+| **With N+1 spare per region** | **0 s user-visible**, ~$1.9/hr per region | the only way to hide it entirely |
+
+Two things follow. First, an instance-level plan (AMI bake, ASG warm pool, N+1
+policy, rolling deploy) buys more than any further Python work, and it is infra
+config, not code. Second, image updates should never cold-start a serving GPU:
+rolling deploy with one spare does that today without any code change.
+
+**Decision needed:** target seconds from scale signal to serving, per region, and
+whether one idle spare per region is acceptable cost. Everything in §4 M4 hangs on it.
+
+### The relay / GPU split (owner's untested idea)
+
+What exists now: `relay/main.py` is `main_server.py` in blank-avatar mode, the
+*same process*. The `relay/` and `avatar/` packages are module boundaries, not
+services. There is no relay that talks to a GPU process today.
+
+Two ways to split, with very different latency risk:
+
+| Design | Who owns WebRTC + audio playback | What crosses the boundary | Added latency | Risk |
+|---|---|---|---|---|
+| **A** | GPU process | relay → GPU: model PCM in 120 ms chunks + control events, over a Unix socket / gRPC on the same host | < 1 ms local, ~1 ms same-AZ | low: A/V sync stays in one process, as now |
+| **B** | relay process | GPU → relay: rendered 720×720 frames at 25 fps (~39 MB/s) | fine over shared memory, poor over a network | high: cross-process A/V sync, a new frame transport |
+
+The developer's "latency will be high" concern is right for B over a network and
+wrong for A on one host. The feature step is already 120 ms; a 1 ms hop is noise.
+
+What A buys: the GPU image changes rarely (models, render code), so most deploys
+touch only the relay and never cold-start a GPU. What it does **not** buy: faster
+scale-out (the GPU image still has to boot on a new instance). Cost: a protocol
+between the two, two processes to supervise, and the greeting path crosses a
+socket (measure it; expect +1–2 ms).
+
+**Owner's reading, confirmed 2026-09-16:** same machine ≈ in-process; only a
+network hop between hosts would cost anything. So this is worth an experiment.
+
+**Experiment E1 (cheap first step, before any design work).** The CPU-only relay
+already runs `main_server` with video disabled by flag (locally today), and the
+GPU build enables video by flag. That is the harness: run two processes on one
+GPU box — the relay process in blank mode, a GPU process with video — and stream
+120 ms PCM chunks from the first to the second over a Unix socket. Measure (a)
+socket round-trip histogram, (b) greeting time, (c) time to first rendered
+frame, against the single-process numbers (774 ms greeting). Expected: +1–2 ms.
+If that holds, design A proceeds; if it does not, the reason is in the
+histogram, not in a debate.
+
+**Recommendation:** run E1 any time; do the real split as design A *after*
+backlog 04 (module extraction) has moved the code out of `main_server.py`, at
+which point the split is a transport decision, not a refactor. Gate: greeting
+≤ 800 ms and `quality_gate` IDENTICAL before/after.
+
+---
+
+## 3. Truths to carry forward (so nobody re-derives them)
+
+- GPU is not the bottleneck at 1–2 sessions; CPU is 7 % busy; the render path is
+  exonerated. Per-frame work only matters for **density** (cost), and density is
+  bounded by GPU time, which Rust does not change.
+- Production blend is 0.79 ms. "15.9 ms cv2 morphology" is a CLI-prep number.
+  GPU blending has no runtime value.
+- VAE decode (~8 ms, does not batch) is half the GPU time per frame and the
+  biggest single per-frame lever; UNet halves again going batch 4 → 8.
+- All TASK-* numbers are from the fork stack (torch 2.11/cu128); production is
+  torch 2.1.0/cu121. Re-measure on production before quoting.
+- Multi-session is structurally present (`WebRTCServer.sessions`, one render
+  service) and **unvalidated**; all sessions serialise on one render thread.
+- The talk ratio (~35 %) and "GPU 15 % busy with idle skip" are assumptions.
+  `/metrics` can measure them in a week (Q7).
+- `cudnn.benchmark = False` and TASK-020 are one-flag experiments that were
+  written down and never run.
+
+---
+
+## 4. Pending work — effort vs outcome
+
+Rows are ordered so that the cheapest things with a measurable outcome come
+first. **QG** = must run `quality_gate.py compare` (§5). **Proof** is what goes in
+the PR. Effort is one engineer with GPU access.
+
+### Quick wins — hours to one day each
+
+| # | Task | Outcome | Effort | QG | Proof |
+|---|---|---|---|---|---|
+| Q1 | Entrypoint: CI fails if image lacks `s5cmd` (review §2.1); measure the weights-from-S3 half on the committed image. The concurrency retune is **dropped**: on 2026-09-18 the committed `s5cmd sync` pulled the 5.9 GB avatar cache in 8 s (log line `Avatar cache downloaded in 8s`), faster than the hand-run 28 s the review compared against | weights half measured; s5cmd guard in CI | 1–2 h | no | entrypoint log line for weights; a test image without s5cmd fails loudly |
+| Q2 | Fix HF fallback: convert to `unet.safetensors` in `download_weights.sh` (review §2.2) | fallback boots instead of `exit 1` | 1–2 h | no | boot with `S3_WEIGHTS_URI` unset reaches "listening" |
+| Q3 | `torch.backends.cudnn.benchmark = False` A/B (WARM-START-V1 Option B) | −3 s boot, −4.5 s background warmup, removes the per-shape stall class — *or* a measured reason to keep it | ½ day | yes (should be near-IDENTICAL) | ms/frame batch 1..7 both ways; greeting; 10-min soak |
+| Q4 | Drop the render half of `warmup()`; keep whisper (backlog 02 step 2) | −2–3 s time-to-listening | 2 h | yes | boot log timestamps; first-turn stall unchanged |
+| Q5 | Store `unet.safetensors` as **fp16** on S3 (inference is fp16 already) | download −1.5 GB, RAM −1.5 GB | 2 h + upload | yes (expect IDENTICAL) | bit-compare weights in VRAM |
+| Q6 | Skip `dwpose/`, `s3fd/`, `face-parse-bisent/` downloads when a runtime cache exists (they are lazy already) | download −0.6 GB | 2 h | no | entrypoint log |
+| Q7 | Log talk ratio and GPU-busy fraction from `/metrics` for a week in each region | replaces the 35 % assumption every capacity number uses | 2 h + wait | no | a table in this doc |
+| Q8 | TASK-020 steps 1–3 from an Indian wifi client → ap-south-2 | know whether 4 Mbps no-slow-start still causes freezes on the real path | ½ day | no | filled TASK-020 table |
+| Q9 | Record `quality_gate` baseline + noise floor per avatar on the accepted build; upload to the env bucket | prerequisite for every QG row | 1 h | — | `results/quality/<sha>/` on S3 |
+
+Expected after Q1–Q6: download ~2.2 GB models + 5.9 GB avatar ≈ 8 GB (~20 s),
+Python ~12 s → cold ~35 s from the committed script; warm ~10 s.
+
+### Medium — two to five days each
+
+| # | Task | Outcome | Effort | QG | Proof |
+|---|---|---|---|---|---|
+| M1 | Idle frames as **256×256 pre-blend crops**, blended at lookup (review §4.2; same pixels, see `build_idle_cycle`) | download −2.3 GB, RAM −2.3 GB; with Q5/Q6 the payload (~3.1 GB without rgb_frames change) fits the burst window → ~5–8 s download | 2 days | yes (expect IDENTICAL on idle set) | idle set IDENTICAL; idle lookup < 1.5 ms |
+| M2 | Batch size / `render_ahead_frames` sweep in production (4 → 6 → 8) | UNet per-frame 7.1 → 3.6 ms at 8; density +25–40 % at +160–320 ms turn-start latency | 2 days | yes (IDENTICAL expected — same math) | `/metrics` fpb, p95, over-budget windows; greeting delta |
+| M3 | **Cheaper GPU benchmark**: run the current image for one hour each on g5.xlarge (A10G) and g6.xlarge (L4) in ap-south-2 / us-east-1 | the cost decision with data; A10G may hold 1 session as-is at ~55 % of L40S price | 1 day + ~$5 | yes (same code, different card — expect PASS) | ms/frame batch 4, p95, one live session per card |
+| M4 | Instance-level scale plan: AMI with image pre-pulled + models; ASG warm pool eval; N+1 and rolling-deploy policy (§2) | scale-out 3–5 min → ~60–90 s; deploys never cold-start a serving GPU | 3–5 days infra | no | measured "scale signal → serving" per region |
+| E1 | **Service-split spike** (§2): relay process (blank mode) → GPU process over a Unix socket on one box; measure socket RTT, greeting, first frame | proves the "≈ in-process" claim before B3 design work | 1–2 days | no | greeting ms before/after; RTT histogram |
+| M6 | Production torch upgrade + prep/runtime image split (mmcv-lite at runtime, full mmcv in prep image) | working `torch.compile`, newer cuDNN, smaller runtime image; unlocks B2 | 4–5 days | yes | QG PASS on the new stack; image size; boot time |
+| M7 | Multi-session validation: two real sessions talking at once; per-session `/metrics`; head-of-line blocking on the single render queue | the first *measured* density number | 2–3 days | no | table: sessions × p95 × over-budget windows |
+
+### Big bets — weeks, each gated
+
+| # | Task | Gate to start | Outcome if it works |
+|---|---|---|---|
+| B1 | ONNX/TensorRT per `ONNX-EXPORT-SCOPE.md` + review §3.6 additions (external-data export, TRT version pin prep = runtime, ORT-CUDA autotune caveat, honest boot claim ~5 s) | M7 shows density is short after M2, and M3 did not close the cost gap | per-frame ~2×; boot −5 s |
+| B2 | `torch.compile` on the single render thread with inductor cache on NVMe (the old "per-thread recompile" objection is gone) | after M6 | UNet 1.6×, VAE untested; a cheaper cousin of B1 |
+| B3 | Relay / GPU split, design A (§2) | E1 shows ≤ +5 ms; after backlog 04 extraction | deploys stop cold-starting GPUs |
+| B4 | Warm-pool automation / session routing across a pool | after M4 and the §2 decision | scale-out hidden from users |
+
+### Not now — struck, with the reason
+
+| Item | Why |
+|---|---|
+| GPU blending at runtime | targets 15.9 ms that production does not spend (review §3.1); prep-only value |
+| Rust port | changes no GPU time; CPU is 7 % busy; its cost case (T4) fails on VAE decode; keep `RUST-PORT-STRATEGY.md` as a design note |
+| T4 | 22–44 ms VAE decode alone; needs TAESD, which violates the quality rule |
+| Region migration to ap-south-1 | already in ap-south-2 and us-east-1 |
+| TAESD as a plan item | quality must not degrade; allowed only as a QG measurement, expected REVIEW/FAIL |
+| KV cache, reference-latent cache, pixel cross-fade | already resolved false / rejected in CONSOLIDATED-TRUTH |
+| More vCPU | measured: does not help |
+
+---
+
+## 5. Quality policy — the gate every render change passes
+
+**Tool:** [`quality_gate.py`](../../quality_gate.py) (CPU tests:
+[`tests/test_quality_gate.py`](../../tests/test_quality_gate.py)).
+
+**What it does.** Renders a fixed, deterministic set — 100 idle frames spread
+across the cycle and 150 talking frames from a fixed wav — through the real
+engine, then scores a candidate against a saved reference on the **face region**:
+PSNR (min and mean), SSIM, mouth-region PSNR, temporal flicker, Laplacian
+sharpness, plus timing (ms/frame p50/p95, idle lookup). It writes `compare.md`,
+`compare.json`, and `worst_frames.png` (reference | candidate | diff for the four
+worst frames) so the human looks at the frames most likely to be wrong, not a
+random minute of video.
+
+**Verdicts and what to do**
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| IDENTICAL | every frame bit-identical | merge |
+| PASS | min face PSNR ≥ 40 dB, SSIM ≥ 0.98, no flicker/sharpness regression | merge; note timing delta |
+| REVIEW | face PSNR 32–40 or SSIM 0.95–0.98 | open `worst_frames.png`; one person decides; write the decision in the PR |
+| FAIL | below those, or flicker up > 25 %, sharpness down > 15 %, geometry changed | do not merge |
+
+**Process — one command**
+
+The same command every time, on the GPU box, inside the container:
+
+```bash
+docker exec -w /app <container> python quality_gate.py check \
+    --audio data/audio/eng.wav --s3 s3://<env-bucket>/quality -- --avatar_id avator_1
+```
+
+1. **First run for an avatar** (or a fresh instance with `--s3` and nothing in
+   the bucket): records the baseline and the noise floor into the store and
+   exits 0. Do this once on the build you trust today (Q9).
+2. **Every later run**: captures, compares against the stored baseline using
+   the noise floor, stores the run under `runs/<timestamp>-<sha7>/` with
+   `compare.md` and `worst_frames.png`, prints the verdict, exits 0 / 2 / 1.
+3. **Adopting a change** after a PASS you agree with:
+   `python quality_gate.py accept --avatar avator_1 --s3 s3://<env-bucket>/quality`
+   promotes the latest run to baseline and moves the old one to `history/`.
+   Re-record the noise floor when the stack changes (torch/cuDNN), by deleting
+   `noise/` before the next check.
+4. The store lives at `/opt/dlami/nvme/quality` on the box (mount the NVMe into
+   the container, as the perf-build summary shows) and is mirrored to the env
+   bucket with `--s3`, so a new instance starts with the baseline, not a new one.
+5. Every PR touching the render path attaches that run's `compare.md` and
+   `worst_frames.png`. A change that claims to *improve* quality needs
+   sharpness ratio > 1 or flicker ratio < 1 on the script **and** a human A/B on
+   the worst frames **and** one live session. The script can prove "not worse";
+   only eyes can say "better".
+6. Not covered by the script: lip-sync timing, A/V sync, network. Those stay with
+   `/metrics` and `chrome://webrtc-internals`.
+
+Use the same server flags (`--avatar_id`, batch size, decoder) for baseline and
+checks, or the flag change is part of what you measure. The lower-level modes
+(`capture`, `compare`, `noise-floor`, `report`) remain for ad-hoc comparisons;
+`report` needs no GPU.
+
+**Status (2026-09-18) — Q9 done.** The accepted baseline for `avator_1` is
+`perf-s3-avatar-cache` @ `81d7406` (L40S, torch 2.1.0+cu121): talk p50
+17.3 ms, p95 24.1 ms per frame. It lives at `/opt/dlami/nvme/quality/avator_1`
+on the dev box and is mirrored to `s3://taiboli-dev-ml-weights/quality`
+(the dev weights bucket, `quality/` prefix — the per-env convention from now
+on). Verified: a fresh store with `--s3` pulls that baseline and compares
+against it instead of recording a new one. The in-process noise floor is
+bit-identical; a second process on the same build scores min face PSNR
+68.5–69.3 dB (PASS, ~28 dB above the bar), so cross-run drift exists but is far
+from visible. The first `accept --s3` silently left the old baseline on S3 —
+`sync` skips same-size files with an older mtime, and a promoted baseline is
+exactly that — so `accept` now force-copies the baseline directory.
+
+---
+
+## 6. 30 fps — aspirational, last
+
+**Owner's call (2026-09-16):** the last experiment, after everything else has
+settled. It is not scheduled and appears in no table above. Kept here so the
+unknowns are on record when the time comes.
+
+| Aspect | What changes | Status |
+|---|---|---|
+| Budget | 40 ms → 33 ms per frame; render is 16.6 ms, VP8 ~7.7 ms on its own thread | fits for 1 session; density −20 % |
+| Audio → prompt mapping | whisper features are 50 Hz, mapped 2-per-frame at 25 fps. At 30 fps the mapping is fractional; `StreamingMuseTalkFeatureExtractor(fps=...)` takes `fps`, but whether the windowing is time-based or frame-count-based must be checked before trusting it | **unknown — check first** |
+| Source cycle | if the avatar video is 25 fps, replaying its 1874-frame cycle at 30 fps makes head motion 20 % faster, or needs interpolation | likely the most visible effect |
+| Bandwidth | +20 % frames at the same bitrate ⇒ fewer bits per frame; raise bitrate or accept softer frames | interacts with Q8 |
+| Idle cache | unchanged (cycle index, not time) | — |
+| Measurement | `quality_gate` cannot compare 25 vs 30 fps frame-for-frame; compare per-time (nearest frame) plus a human A/B | needs a small script change |
+
+Recommendation: a flag, the extractor check, then a human A/B of the same 30 s
+turn at 25 and 30 fps. If the source video is 25 fps, expect the honest answer
+to be "smoother mouth, oddly fast head", and stop there unless a 30 fps source
+is recorded.
+
+---
+
+## 7. Document map — consolidated 2026-09-16
+
+| File | Role | What was done |
+|---|---|---|
+| **`PERF-STATUS-AND-PLAN.md`** | the plan | this page |
+| `PERFORMANCE-COMPLETE.md` | record of shipped work | §4–5 (roadmap, Rust) replaced by a pointer here; per-frame table annotated; "network verified" row corrected; torch.compile "ruled out" row corrected |
+| `CONSOLIDATED-TRUTH.md` | claims ledger | role banner added; three surviving CACHING-STRATEGY items added to the unverified table; links repointed to `archive/` |
+| `ADVERSARIAL-REVIEW-2026-09-16.md` | dated review | answers to its open questions recorded in its §8 |
+| `COLD-START-OPTIMIZATION.md`, `WARM-START-V1.md` | measurement records | stack header + caveats added |
+| `ONNX-EXPORT-SCOPE.md` | design note for B1 | review additions appended; gate stated |
+| `RUST-PORT-STRATEGY.md` | design note, gated | gate banner at top |
+| `MuseTalk-Architecture.md` | model reference | link repointed |
+| `README.md` | index | rewritten |
+| `archive/` | superseded analyses | `STARTUP-PERF`, `BENCHMARK-TASKS`, `CACHING-STRATEGY`, `PERF-ROADMAP`, `MuseTalk-Scaling-Plan`, `MuseTalk-Architecture-Breakdown` moved in, with a README giving the reason for each |
+| `archive/fork-benchmarks/` | fork results | the nine `TASK-*.md` files, with a README stating the stack they were measured on |
+| `backlog/02-warm-start.md`, `backlog/03-cold-start.md` | tracked items | rewritten from §4 |
+| `architecture/operations.md` | boot path | production boot path callout added; bind-mount path marked legacy |
+
+Not touched: `documentation/memory/*` (managed through the `brief` CLI; four
+notes mention `STARTUP-PERF.md` in prose — it now lives in `archive/`).
+
+---
+
+## 8. Perf build channel and how the gate runs
+
+**Builds.** Pushes to `perf/**` branches no longer trigger `build-push-ecr.yml`
+or `build-base.yml`, so they cannot overwrite `:dev` or the production base
+`:latest`. Instead `.github/workflows/build-perf.yml` runs automatically on a
+`perf/**` push that touches code (docs, tests and the plan are ignored; add
+`[skip ci]` to suppress) and publishes `<repo>:perf-<slug>` (rolling) and
+`<repo>:perf-<slug>-<sha7>` (immutable) on the production base. A newer push
+cancels an in-flight build. Run it by hand (Actions → Build Perf Image) with
+`build_base` ticked when the branch changed `requirements.txt` or
+`Dockerfile.base`; that produces a `perf-<slug>` base and never touches
+`:latest`. `promote.yml` refuses `perf-*` tags by construction. Adopting a
+verified build means merging the branch to main and letting the regular flow
+publish it — one layer at a time, so each merge is small.
+
+**Where each part runs.** CodeBuild (no GPU) only builds and pushes the image.
+The gate runs on the GPU box by hand. Nothing needs cloning there: the image
+carries `quality_gate.py`, `perf_check.sh` and the speech clip
+`data/audio/eng.wav` (re-included in `.dockerignore` for this purpose). Get the
+runner out of the image once, then it is one line per build:
+
+```bash
+sudo /opt/gpu-server/scripts/fetch-env.sh      # once per boot: SSM → /run/avatar.env
+docker run --rm --entrypoint cat <ecr>/musetalk:perf-<slug>-<sha7> /app/perf_check.sh > perf_check.sh && chmod +x perf_check.sh
+./perf_check.sh --s3 s3://<env-bucket>/quality <ecr>/musetalk:perf-<slug>-<sha7>
+```
+
+It pulls the image and starts it on port 8001 with the box's `/opt/models`
+(read-only in practice), its **own** avatar cache directory
+(`/opt/dlami/nvme/perf-avatar-cache`, never the serving container's, so a perf
+build may rewrite it — empty it to time a cold S3 pull) and the quality store
+mounted. It reads `/run/avatar.env` through `sudo` because that file is root
+0600. Then it waits for `/health`, prints the seconds and whether the avatar
+cache was downloaded or reused, runs `quality_gate.py check` inside the
+container, prints the verdict, and leaves the container running so a human can
+open a live session against the same build (SSH tunnel: `-L 8001:localhost:8001`;
+the Cloudflare tunnel only routes to 8000). Two builds can sit side by side on
+different ports (`--port 8002`). Verified 2026-09-18 on the dev box with no
+flags: healthy in 20 s, gate PASS, the serving container on 8000 untouched.
+
+Images built after 2026-09-18 carry `GIT_SHA` (build arg → env), so gate runs
+and baselines are labelled with the commit instead of `unknown`.
+
+**The gate does not capture video.** `quality_gate.py` never records a live
+session or the WebRTC stream. It imports the engine in-process on the GPU box,
+renders a fixed set of frames deterministically (100 idle poses spread across
+the cycle, 150 talking frames from a fixed wav through the real whisper → UNet →
+VAE → blend path), and compares those arrays against a saved reference capture.
+That is what makes IDENTICAL a meaningful verdict. It has to run where the models
+are: inside the container on the GPU instance, via `docker exec`. The CodeBuild
+runners have no GPU, so it is not in CI; the workflow summary prints the two
+commands. To compare two perf builds in parallel, start both containers on the
+box on different ports and run `capture` in each, then `report` on a laptop.
+
+What it does not cover — lip-sync timing, A/V sync, network behaviour — stays
+with `/metrics`, `chrome://webrtc-internals`, and a human watching a live turn.
+
+---
+
+## 9. Folded from `PERF-ROADMAP.md` (2026-09-11), still valid
+
+### Image architecture — prep vs runtime
+
+Two images. **Prep** (build-time, infrequent): runs avatar prep, model
+conversion (fp16 safetensors, later ONNX/TensorRT), uploads artefacts to S3.
+Contains torch, diffusers, transformers, full mmcv/mmpose, build tools. Runs in
+CI or on an ad-hoc GPU instance when avatars or models change. **Runtime**
+(per instance, optimised for boot): downloads artefacts, serves sessions.
+Target ~3–4 GB.
+
+Current state: `Dockerfile.base` is multi-stage (devel builder → runtime without
+the CUDA compiler, ~3 GB saved); build-only deps are in `requirements-build.txt`
+but still carried into runtime; mmcv/mmpose stay in runtime until the S3 avatar
+cache is proven in production. The next step is plan M6 (torch upgrade + real
+split with mmcv-lite at runtime), not ONNX.
+
+| File | Role |
+|---|---|
+| `requirements.txt` | runtime deps |
+| `requirements-build.txt` | build/prep-only deps |
+| `Dockerfile.base` | multi-stage: devel builder → runtime |
+| `Dockerfile` | app layer |
+
+### Ruled out: Firecracker / Lambda MicroVMs for GPU
+
+Investigated 2026-09-11. Neither supports GPU passthrough. Firecracker:
+[firecracker#1179](https://github.com/firecracker-microvm/firecracker/issues/1179)
+(parked since 2019; pinned physical memory breaks its oversubscription design;
+one workload per physical GPU). Lambda MicroVMs: CPU/memory only. The ~125 ms
+microVM boot is not available for GPU workloads; the answer to hidden startup is
+the instance-level plan in §2 (warm pool, baked AMI, N+1).

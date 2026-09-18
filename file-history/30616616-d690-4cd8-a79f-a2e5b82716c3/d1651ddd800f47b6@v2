@@ -1,0 +1,206 @@
+"""CPU tests for quality_gate.py's metrics and verdict logic.
+
+The point of these tests is the verification-discipline rule: a gate that
+cannot go red is not a gate. Every verdict level is produced here on purpose.
+"""
+import json
+import os
+
+import numpy as np
+import pytest
+
+import quality_gate as qg
+
+H, W, N = 96, 96, 8
+BOX = (24, 88, 16, 80)  # y1, y2, x1, x2
+
+
+def _frames(seed=0):
+    rng = np.random.default_rng(seed)
+    base = rng.integers(0, 256, size=(H, W, 3), dtype=np.uint8)
+    # a smooth "face" so sharpness / ssim have structure to measure
+    yy, xx = np.mgrid[0:H, 0:W]
+    face = (127 + 100 * np.sin(yy / 6.0) * np.cos(xx / 5.0)).astype(np.uint8)
+    base[BOX[0]:BOX[1], BOX[2]:BOX[3]] = face[BOX[0]:BOX[1], BOX[2]:BOX[3], None]
+    out = np.stack([base.copy() for _ in range(N)])
+    # slow drift frame to frame so flicker is non-zero in the reference
+    for t in range(N):
+        out[t] = np.clip(out[t].astype(np.int16) + t, 0, 255).astype(np.uint8)
+    return out
+
+
+def _boxes():
+    return [BOX] * N
+
+
+def test_identical_is_identical():
+    ref = _frames()
+    m = qg.compare_frames(ref, ref.copy(), _boxes())
+    assert m["identical"] == N
+    assert m["face_psnr_min"] == float("inf")
+    assert m["face_ssim_mean"] == pytest.approx(1.0)
+    assert qg.verdict(m, m)[0] == "IDENTICAL"
+
+
+def test_small_noise_passes():
+    ref = _frames()
+    rng = np.random.default_rng(1)
+    cand = np.clip(ref.astype(np.int16) + rng.integers(-1, 2, size=ref.shape), 0, 255).astype(np.uint8)
+    m = qg.compare_frames(ref, cand, _boxes())
+    assert m["identical"] < N
+    assert m["face_psnr_min"] > qg.THRESH["pass_psnr"]
+    assert qg.verdict(m, m)[0] == "PASS"
+
+
+def test_heavy_blur_fails():
+    """Negative test: a visibly degraded candidate must go red."""
+    import cv2
+    ref = _frames()
+    cand = np.stack([cv2.GaussianBlur(f, (15, 15), 6.0) for f in ref])
+    m = qg.compare_frames(ref, cand, _boxes())
+    label, reasons = qg.verdict(m, m)
+    assert label == "FAIL", reasons
+    assert m["sharpness_ratio"] < qg.THRESH["sharp_ratio"]
+
+
+def test_moderate_change_is_review():
+    ref = _frames()
+    rng = np.random.default_rng(2)
+    cand = np.clip(ref.astype(np.int16) + rng.integers(-6, 7, size=ref.shape), 0, 255).astype(np.uint8)
+    m = qg.compare_frames(ref, cand, _boxes())
+    assert qg.THRESH["review_psnr"] <= m["face_psnr_min"] < qg.THRESH["pass_psnr"]
+    label, _ = qg.verdict(m, m)
+    assert label in ("REVIEW", "FAIL")  # SSIM may push it to FAIL; must not PASS
+    assert label != "PASS"
+
+
+def test_flicker_regression_fails():
+    ref = _frames()
+    cand = ref.copy()
+    # alternate frames jump by 12 levels inside the face only -> temporal instability
+    for t in range(0, N, 2):
+        cand[t, BOX[0]:BOX[1], BOX[2]:BOX[3]] = np.clip(
+            cand[t, BOX[0]:BOX[1], BOX[2]:BOX[3]].astype(np.int16) + 12, 0, 255).astype(np.uint8)
+    m = qg.compare_frames(ref, cand, _boxes())
+    assert m["flicker_ratio"] > qg.THRESH["flicker_ratio"]
+    assert qg.verdict(m, m)[0] == "FAIL"
+
+
+def _metrics(**over):
+    base = {"frames": N, "identical": 0, "face_psnr_min": 50.0, "face_ssim_mean": 0.995,
+            "flicker_ratio": 1.0, "sharpness_ratio": 1.0}
+    base.update(over)
+    return base
+
+
+def test_noise_floor_relaxes_psnr_bar_only_downward():
+    # PSNR alone sits in the REVIEW band; SSIM, flicker, sharpness are clean.
+    m = _metrics(face_psnr_min=38.0)
+    assert qg.verdict(m, m)[0] == "REVIEW"
+    # A recorded floor of 38.5 dB means 38.0 is within the pipeline's own drift.
+    noise = {"talk": {"face_psnr_min": 38.5}, "idle": {"face_psnr_min": 99.0}}
+    assert qg.verdict(m, m, noise=noise)[0] == "PASS"
+    # A floor above the default bar must not tighten it past 40 dB.
+    tight = {"talk": {"face_psnr_min": 99.0}, "idle": {"face_psnr_min": 99.0}}
+    ok = _metrics(face_psnr_min=41.0)
+    assert qg.verdict(ok, ok, noise=tight)[0] == "PASS"
+    assert qg.verdict(m, m, noise=tight)[0] == "REVIEW"
+    # The floor never rescues an SSIM or sharpness failure.
+    bad_ssim = _metrics(face_psnr_min=38.0, face_ssim_mean=0.97)
+    assert qg.verdict(bad_ssim, bad_ssim, noise=noise)[0] == "REVIEW"
+    assert qg.verdict(_metrics(face_psnr_min=38.0, sharpness_ratio=0.5), m, noise=noise)[0] == "FAIL"
+
+
+def test_geometry_mismatch_fails(tmp_path):
+    ref = _frames()
+    a, b = tmp_path / "a", tmp_path / "b"
+    qg.save_capture(str(a), ref, _boxes(), ref, _boxes(), {"timing": {"talk_ms_per_frame_p50": 10.0}})
+    other = [(BOX[0] + 2, BOX[1], BOX[2], BOX[3])] * N
+    qg.save_capture(str(b), ref, _boxes(), ref, other, {"timing": {"talk_ms_per_frame_p50": 9.0}})
+    label, result = qg.score_captures(str(a), str(b), str(tmp_path / "out"))
+    assert label == "FAIL"
+    assert result["talk"]["geometry_mismatch"]
+    assert os.path.exists(tmp_path / "out" / "compare.md")
+
+
+def test_report_cli_exit_codes(tmp_path):
+    ref = _frames()
+    a, b = tmp_path / "a", tmp_path / "b"
+    meta = {"timing": {"talk_ms_per_frame_p50": 16.6, "talk_ms_per_frame_p95": 18.8}}
+    qg.save_capture(str(a), ref, _boxes(), ref, _boxes(), meta)
+    qg.save_capture(str(b), ref, _boxes(), ref, _boxes(), meta)
+    assert qg.main(["report", "--ref", str(a), "--cand", str(b), "--out", str(tmp_path / "o")]) == 0
+    out = json.load(open(tmp_path / "o" / "compare.json"))
+    assert out["verdict"] == "IDENTICAL"
+    assert os.path.exists(tmp_path / "o" / "worst_frames.png")
+
+    import cv2
+    bad = np.stack([cv2.GaussianBlur(f, (15, 15), 6.0) for f in ref])
+    qg.save_capture(str(tmp_path / "c"), bad, _boxes(), bad, _boxes(), meta)
+    assert qg.main(["report", "--ref", str(a), "--cand", str(tmp_path / "c")]) == 1
+
+
+def test_store_layout_and_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("QUALITY_STORE", str(tmp_path / "store"))
+    assert qg.default_store() == str(tmp_path / "store")
+    p = qg.store_paths(qg.default_store(), "avator_1")
+    assert p["baseline"].endswith("avator_1/baseline")
+    assert not qg.has_baseline(p)
+
+
+def test_accept_promotes_run_and_keeps_history(tmp_path):
+    ref = _frames()
+    meta = {"git_sha": "aaa1111", "timing": {"talk_ms_per_frame_p50": 16.0}}
+    p = qg.store_paths(str(tmp_path), "av")
+    qg.save_capture(p["baseline"], ref, _boxes(), ref, _boxes(), meta)
+    run = os.path.join(p["runs"], "20260916T000000-bbb2222")
+    qg.save_capture(run, ref, _boxes(), ref, _boxes(), {"git_sha": "bbb2222", "timing": {}})
+    assert qg.latest_run(p) == run
+    assert qg.main(["accept", "--store", str(tmp_path), "--avatar", "av"]) == 0
+    new_meta = json.load(open(os.path.join(p["baseline"], "meta.json")))
+    assert new_meta["git_sha"] == "bbb2222"
+    assert os.path.exists(os.path.join(p["baseline"], "ACCEPTED.txt"))
+    hist = os.listdir(p["history"])
+    assert len(hist) == 1 and hist[0].startswith("baseline-aaa1111-")
+    # accepting a non-capture is refused
+    with pytest.raises(SystemExit):
+        qg.accept_run(p, str(tmp_path / "nope"))
+
+
+def test_accept_force_pushes_baseline_to_s3(tmp_path, monkeypatch):
+    """A promoted baseline has the run's mtime and the same sizes as the old
+    one, so a plain sync skips it; accept must push it unconditionally."""
+    ref = _frames()
+    p = qg.store_paths(str(tmp_path), "av")
+    qg.save_capture(p["baseline"], ref, _boxes(), ref, _boxes(), {"git_sha": "aaa1111", "timing": {}})
+    run = os.path.join(p["runs"], "20260916T000000-bbb2222")
+    qg.save_capture(run, ref, _boxes(), ref, _boxes(), {"git_sha": "bbb2222", "timing": {}})
+    calls = []
+    monkeypatch.setattr(qg, "s3_sync", lambda src, dst, force=False: calls.append((src, dst, force)) or True)
+    assert qg.main(["accept", "--store", str(tmp_path), "--avatar", "av", "--s3", "s3://b/quality/"]) == 0
+    forced = [c for c in calls if c[2]]
+    assert forced == [(p["baseline"], "s3://b/quality/av/baseline", True)]
+    assert (p["root"], "s3://b/quality/av", False) in calls
+
+
+def test_s3_sync_force_uses_cp_not_sync(monkeypatch):
+    seen = []
+    monkeypatch.setattr(qg.subprocess, "run", lambda cmd, check: seen.append(cmd))
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/s5cmd" if name == "s5cmd" else None)
+    assert qg.s3_sync("/x/baseline", "s3://b/q/av/baseline", force=True)
+    assert qg.s3_sync("/x", "s3://b/q/av")
+    assert seen[0][:2] == ["s5cmd", "cp"] and seen[0][2] == "/x/baseline/*"
+    assert seen[1][:2] == ["s5cmd", "sync"]
+    # aws cli fallback: cp needs --recursive, sync must not get it
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/aws" if name == "aws" else None)
+    assert qg.s3_sync("/x/baseline", "s3://b/q/av/baseline", force=True)
+    assert qg.s3_sync("/x", "s3://b/q/av")
+    assert seen[2][:3] == ["aws", "s3", "cp"] and "--recursive" in seen[2]
+    assert seen[3][:3] == ["aws", "s3", "sync"] and "--recursive" not in seen[3]
+
+
+def test_server_args_split():
+    own, server = qg._split_args(["capture", "--out", "x", "--", "--avatar_id", "a"])
+    assert own == ["capture", "--out", "x"]
+    assert server == ["--avatar_id", "a"]

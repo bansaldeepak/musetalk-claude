@@ -1,0 +1,25 @@
+---
+name: project-perf-parallel-container
+description: "How to run a perf build side by side with the serving container on a GPU box (dev-hd box facts, perf_check.sh one-command run, quality baseline on S3, cold-start numbers measured 2026-09-18)"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 30616616-d690-4cd8-a79f-a2e5b82716c3
+  modified: 2026-09-18T09:02:25.177Z
+---
+
+**Dev GPU box (2026-09-18):** `i-00da21ca8277ecd1d`, account 368351959688, role `taiboli-dev-hd-instance-profile-gpu-server-role`, region ap-south-2, public IP 16.113.55.93, key `~/.ssh/taiboli-non-prod-gpu`. Serving container `musetalk` (`:dev`, host network, port 8000, mounts `/opt/models` + `/opt/musetalk-data/video`, NO NVMe mount). Cloudflare tunnel routes `dev-avatar.taiboli.in` → 8000 only. This is NOT the prod box from earlier sessions (account 985..., NVMe avatar cache shared with prod).
+
+**Parallel perf run:** `sudo /opt/gpu-server/scripts/fetch-env.sh` (SSM → `/run/avatar.env`, root 0600, tmpfs) then `./perf_check.sh [--s3 s3://taiboli-dev-ml-weights/quality] <ecr>/musetalk:perf-<slug>-<sha7>` with no other flags. Defaults fit these boxes since 8d699fb: env via sudo copy, models `/opt/models`, own cache `/opt/dlami/nvme/perf-avatar-cache`, quality store `/opt/dlami/nvme/quality`, port 8001 (bridge, `-p 8001:8000`). `--models <empty dir> --cache <empty dir>` gives a full cold start. Browser test needs `ssh -i ~/.ssh/taiboli-non-prod-gpu -L 8001:localhost:8001 ubuntu@<ip>` then `http://localhost:8001/`. Cross-account ECR pull to 755348349838 works with the instance role; `ecr:DescribeImages/ListImages` does not (use `docker manifest inspect` to check a tag).
+
+**Quality baseline:** `avator_1` accepted at `81d7406`, local store + mirrored to `s3://taiboli-dev-ml-weights/quality` (convention: `<env weights bucket>/quality`). A fresh store with `--s3` pulls and compares (verified). Gotcha found and fixed the same day: `accept --s3` used `s5cmd sync`, which skipped the promoted baseline (same size, older mtime) and left the old one on S3; accept now force-copies `baseline/`.
+
+**Measured 2026-09-18, committed image (`perf-s3-avatar-cache` @ 4a96788 / 81d7406, L40S):**
+- avatar cache only from S3 (weights local): 5.9 GB in 8 s (~740 MB/s); listening 29 s, fully warmed 33 s
+- everything from S3, empty NVMe: 4.2 GB weights + 5.9 GB avatar in parallel = 30 s (~340 MB/s, overruns the ~3.5 GB burst); listening 51 s, warmed 56 s. Python part ≈ 21 s either way
+- warm restart: 20 s to /health; render thread ready 1.5 s, fully warmed 4.7 s after listening (identical on main's `:dev`)
+- S3 avatar cache is core files + `runtime/*.npy` only, no `full_imgs`/`mask` — that is what the branch's `_cache_exists` change enables
+- two containers idle at ~3.2 GB GPU each, ~5 GB after a session; the quality gate measures the live path at ~17 ms/frame p50
+
+**Why:** the plan said the 48 s cold start was "unreproduced by the committed script"; it is now reproduced (51 s) and the s5cmd retune (Q1) is unnecessary — payload size under the burst window is the lever (Q5/Q6/M1).
+**How to apply:** for any perf branch, push → `build-perf.yml` → `perf_check.sh --s3 ...` on the dev box → PASS/IDENTICAL against the stored baseline → merge. See [[reference-gpu-server-ops]], [[project-cold-start-optimization]].

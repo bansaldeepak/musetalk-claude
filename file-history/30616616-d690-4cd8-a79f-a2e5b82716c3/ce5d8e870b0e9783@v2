@@ -1,0 +1,42 @@
+# Agent memory — why and how things were decided
+
+One file per fact. Frontmatter carries `name`, `description` and a `type`
+(`user` / `feedback` / `project` / `reference`); the body states the fact and,
+for feedback and project entries, **Why** and **How to apply**.
+
+These files are the agent harness's persistent memory, committed here so the
+reasoning behind decisions survives a lost server or session and is visible to
+everyone. The `brief` CLI (see `.claude/rules/brief-cli-ops.md`) is not
+installed on the GPU boxes, so on those the sync is a plain copy from the
+harness directory `~/.claude/projects/<project>/memory/` into this folder,
+committed with the work it documents. Newer wins; the harness copy is normally
+newer.
+
+## Index
+
+### Feedback — how the owner wants work done
+
+- [Commit workflow](feedback-commit-workflow.md) — human approval for every commit and push
+- [Code organization](feedback_code_organization.md) — modular `relay/` layout, no `main_server.py` growth, one branch per related piece of work
+- [Disconnect exchange](feedback_disconnect_exchange.md) — partial exchanges are flushed on disconnect, not dropped
+- [Greeting and race](feedback_greeting_and_race.md) — greeting never overrides session instructions; tool-result race uses cancel + defer
+- [Realtime API patterns](feedback_realtime_api_patterns.md) — Azure Realtime gotchas: clock injection, `session.update` kick, rate-limit recovery, cancel race
+
+### Project — ongoing work, decisions, measurements
+
+- [Perf parallel container](project-perf-parallel-container.md) — dev GPU box facts, `perf_check.sh` one-command run, quality baseline on S3, cold-start numbers measured 2026-09-18
+- [Cold start optimization](project-cold-start-optimization.md) — S3 download tuning, EBS vs NVMe, network burst, 15 s Python floor
+- [Warm start v2](project-warm-start-v2.md) — 69 s → 14.3 s warm start, 774 ms greeting, merged to main
+- [MuseTalk benchmark](project-musetalk-benchmark.md) — benchmark environment, progress, execution-plan status
+- [Environment quirks](project-env-quirks.md) — Python 3.12 + PyTorch 2.11 patches on the benchmark box
+- [Codebase map](project_codebase_map.md) — where to find what in MuseTalk and the relay
+- [Relay architecture](project_relay_architecture.md) — Shape D decision, two images from one codebase, TS → Python port plan
+- [Relay port plan](project_relay_port_plan.md) — what is missing, what Python already has, what not to port
+- [Session routing](project_session_routing.md) — server-driven session routing (S-002) shipped 2026-08-31
+
+### Reference — pointers and facts about the environment
+
+- [GPU server ops](reference-gpu-server-ops.md) — `fetch-env.sh`, `start-musetalk.sh`, `/run/avatar.env`, ECR lifecycle
+- [Repo layout](reference-repo-layout.md) — key paths and run commands for the single production repo
+- [Upstream remote](reference-upstream-remote.md) — Panya-Labs/MuseTalk is the one repo; origin direct, deployed to ECR
+- [Startup perf analysis](startup-perf-analysis.md) — early warm/cold start findings, EBS bottleneck, multi-session viability

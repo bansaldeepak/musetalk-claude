@@ -1,4 +1,4 @@
-Memories also committed to `MuseTalk/memory/` in repo so they survive server/session loss.
+Memories also committed to `documentation/memory/` (index: README.md there) in repo so they survive server/session loss.
 
 - [Repo Setup](reference-upstream-remote.md) — Single repo: Panya-Labs/MuseTalk, origin direct, no upstream needed
 - [Repo Layout](reference-repo-layout.md) — File paths, Docker container, key API facts
@@ -8,3 +8,4 @@ Memories also committed to `MuseTalk/memory/` in repo so they survive server/ses
 - [Commit Workflow](feedback-commit-workflow.md) — Human approval required for every commit and push
 - [Environment Quirks](project-env-quirks.md) — Python 3.12 patches: mmcv stubs, torch.load, version bumps
 - [Cold Start Optimization](project-cold-start-optimization.md) — S3 trimming, burst credits, EBS vs NVMe, 15s Python floor, next: reduce Python startup
+- [Perf Parallel Container](project-perf-parallel-container.md) — dev-hd box facts, perf_check.sh one-command run, 2026-09-18 cold-start + quality baseline measurements

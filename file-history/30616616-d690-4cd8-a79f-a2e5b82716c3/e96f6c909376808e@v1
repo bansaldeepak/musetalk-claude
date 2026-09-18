@@ -1,0 +1,62 @@
+#!/bin/bash
+
+# Set the checkpoints directory (entrypoint may override via MODELS_DIR)
+CheckpointsDir="${MODELS_DIR:-models}"
+
+# Create necessary directories
+mkdir -p "$CheckpointsDir"/{musetalk,musetalkV15,syncnet,dwpose,face-parse-bisent,s3fd,sd-vae,whisper}
+
+# Download MuseTalk V1.0 weights
+hf download TMElyralab/MuseTalk \
+  --local-dir $CheckpointsDir \
+  --include "musetalk/musetalk.json" "musetalk/pytorch_model.bin"
+
+# Download MuseTalk V1.5 weights (unet.pth)
+hf download TMElyralab/MuseTalk \
+  --local-dir $CheckpointsDir \
+  --include "musetalkV15/musetalk.json" "musetalkV15/unet.pth"
+
+# Download SD VAE weights
+hf download stabilityai/sd-vae-ft-mse \
+  --local-dir $CheckpointsDir/sd-vae \
+  --include "config.json" "diffusion_pytorch_model.safetensors"
+
+# Download Whisper weights
+hf download openai/whisper-tiny \
+  --local-dir $CheckpointsDir/whisper \
+  --include "config.json" "pytorch_model.bin" "preprocessor_config.json"
+
+# Download DWPose weights
+hf download yzd-v/DWPose \
+  --local-dir $CheckpointsDir/dwpose \
+  --include "dw-ll_ucoco_384.pth"
+
+# Download SyncNet weights
+hf download ByteDance/LatentSync \
+  --local-dir $CheckpointsDir/syncnet \
+  --include "latentsync_syncnet.pt"
+
+# Download Face Parse Bisent weights
+gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
+curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
+  -o $CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth
+
+# Download S3FD face detector weights.
+# musetalk/utils/face_detection/detection/sfd/sfd_detector.py loads this path if
+# present and otherwise falls back to torch.hub load_url. run_setup.sh /
+# run_start.sh weights_present() requires the file, so without it setup_needed()
+# is always true and the whole setup re-runs on every boot.
+# Download to a temp file and move into place: weights_present() only tests for a
+# non-empty file, so a truncated download would satisfy the check forever and
+# then fail at model load.
+if [ -s "$CheckpointsDir/s3fd/s3fd.pth" ]; then
+  echo "s3fd weights already present, skipping."
+elif curl -fL https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth \
+  -o "$CheckpointsDir/s3fd/s3fd.pth.tmp"; then
+  mv "$CheckpointsDir/s3fd/s3fd.pth.tmp" "$CheckpointsDir/s3fd/s3fd.pth"
+else
+  rm -f "$CheckpointsDir/s3fd/s3fd.pth.tmp"
+  echo "WARNING: s3fd download failed; sfd_detector.py will fall back to torch.hub." >&2
+fi
+
+echo "✅ All weights have been downloaded successfully!"

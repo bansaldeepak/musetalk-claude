@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# perf_check.sh — run a perf image on THIS GPU box and put it through the
+# quality gate. One command replaces: pull, run, wait for health, docker exec.
+#
+# No repo clone needed on the box: the script is inside every image at
+# /app/perf_check.sh (Dockerfile does COPY . .). Get it once with
+#
+#   docker run --rm --entrypoint cat <image ref> /app/perf_check.sh > perf_check.sh && chmod +x perf_check.sh
+#
+# quality_gate.py and the speech clip data/audio/eng.wav are in the image too.
+#
+#   ./perf_check.sh [options] <image ref> [extra quality_gate.py check args]
+#
+#   ./perf_check.sh --env-file ~/stg.env <ecr>/musetalk:perf-s3-avatar-cache-94df1f6
+#   ./perf_check.sh --env-file ~/stg.env --port 8002 --s3 s3://bucket/quality <image> --skip-noise
+#
+# Options (each also settable by the environment variable in brackets):
+#   --env-file PATH   .env with S3_WEIGHTS_URI / S3_AVATAR_CACHE_URI / AWS_REGION / realtime keys
+#                     [ENV_FILE, default /opt/musetalk/.env]
+#   --port N          host port for the container [PORT, default 8001; 8000 stays free for prod]
+#   --avatar ID       avatar to test [AVATAR_ID, default avator_1]
+#   --s3 URI          s3://<env-bucket>/quality, mirrors the baseline store [S3_QUALITY_URI, default off]
+#   --nvme DIR        host dir holding models/, avatar-cache/, quality/ [NVME_ROOT, default /opt/dlami/nvme]
+#   --audio PATH      talking-set wav inside the image [AUDIO, default data/audio/eng.wav]
+#   --timeout SECS    wait for /health [HEALTH_TIMEOUT, default 600; a cold S3 download needs ~1 min]
+#
+# First run for an avatar records the baseline; later runs compare against it
+# (see quality_gate.py). The container is LEFT RUNNING on the port afterwards so
+# a human can open a live session against the same build; remove it with
+# `docker rm -f <name>` (the name is printed).
+set -Eeuo pipefail
+
+ENV_FILE="${ENV_FILE:-/opt/musetalk/.env}"
+NVME="${NVME_ROOT:-/opt/dlami/nvme}"
+AVATAR_ID="${AVATAR_ID:-avator_1}"
+PORT="${PORT:-8001}"
+AUDIO="${AUDIO:-data/audio/eng.wav}"
+S3_QUALITY_URI="${S3_QUALITY_URI:-}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-600}"
+
+usage() { sed -n '2,25p' "$0"; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env-file) ENV_FILE="$2"; shift 2 ;;
+    --port)     PORT="$2"; shift 2 ;;
+    --avatar)   AVATAR_ID="$2"; shift 2 ;;
+    --s3)       S3_QUALITY_URI="$2"; shift 2 ;;
+    --nvme)     NVME="$2"; shift 2 ;;
+    --audio)    AUDIO="$2"; shift 2 ;;
+    --timeout)  HEALTH_TIMEOUT="$2"; shift 2 ;;
+    -h|--help)  usage ;;
+    --*)        echo "unknown option: $1"; usage ;;
+    *)          break ;;
+  esac
+done
+
+IMAGE="${1:-}"
+[ -n "$IMAGE" ] || { echo "missing <image ref>"; usage; }
+shift
+
+[ -f "$ENV_FILE" ] || { echo "env file not found: $ENV_FILE (use --env-file PATH)"; exit 2; }
+mkdir -p "$NVME/models" "$NVME/avatar-cache" "$NVME/quality"
+
+# perf-<tag>: keeps one container per build so two builds can sit side by side.
+NAME="perf-$(printf '%s' "$IMAGE" | sed 's#.*[:/]##' | tr -c 'A-Za-z0-9._-' '-')"
+NAME="${NAME%-}"
+
+echo "== pulling $IMAGE"
+docker pull "$IMAGE"
+
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+echo "== starting $NAME on port $PORT"
+docker run -d --name "$NAME" --gpus all -p "${PORT}:8000" \
+  --env-file "$ENV_FILE" \
+  -e AVATAR_ID="$AVATAR_ID" \
+  -v "$NVME/models:/app/models" \
+  -v "$NVME/avatar-cache:/app/results/v15/avatars" \
+  -v "$NVME/quality:/opt/dlami/nvme/quality" \
+  "$IMAGE" --warmup_musetalk >/dev/null
+
+echo "== waiting for /health (up to ${HEALTH_TIMEOUT}s)"
+for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
+  if curl -sf --max-time 2 "localhost:${PORT}/health" >/dev/null; then break; fi
+  if ! docker ps -q --no-trunc | grep -q "$(docker inspect -f '{{.Id}}' "$NAME")"; then
+    echo "container exited during startup:"; docker logs --tail 60 "$NAME"; exit 1
+  fi
+  sleep 1
+done
+curl -sf --max-time 5 "localhost:${PORT}/health" >/dev/null \
+  || { echo "server not healthy after ${HEALTH_TIMEOUT}s:"; docker logs --tail 60 "$NAME"; exit 1; }
+
+echo "== running quality gate inside $NAME"
+set +e
+docker exec -w /app "$NAME" python quality_gate.py check \
+  --audio "$AUDIO" \
+  ${S3_QUALITY_URI:+--s3 "$S3_QUALITY_URI"} \
+  "$@" -- --avatar_id "$AVATAR_ID"
+RC=$?
+set -e
+
+case "$RC" in
+  0) echo "== verdict: PASS/IDENTICAL (or baseline recorded)";;
+  2) echo "== verdict: REVIEW — open worst_frames.png from the run dir printed above";;
+  *) echo "== verdict: FAIL (exit $RC)";;
+esac
+echo "== $NAME is still running on port $PORT for a live look. Remove with: docker rm -f $NAME"
+exit "$RC"
