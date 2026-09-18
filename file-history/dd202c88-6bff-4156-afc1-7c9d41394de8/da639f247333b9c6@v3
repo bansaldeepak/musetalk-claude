@@ -1,0 +1,34 @@
+.DS_Store
+*.log
+.idea/
+.vscode/
+*.pyc
+.ipynb_checkpoints
+/models/
+**/__pycache__/
+*.py[cod]
+*$py.class
+dataset/
+ffmpeg*
+ffmprobe*
+ffplay*
+debug
+exp_out
+.gradio
+
+# Runtime caches
+/cache/
+
+# Benchmark artifacts (too large for git)
+results/ground_truth/frames/
+results/*/frames/
+results/*/face_crops/
+*.mp4
+*.npy
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.engine
+.venv/
+.env

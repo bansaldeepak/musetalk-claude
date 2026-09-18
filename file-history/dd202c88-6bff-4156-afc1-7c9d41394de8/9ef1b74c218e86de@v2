@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""One-time conversion: UNet .pth → .safetensors for faster loading.
+
+Usage (inside the container or with the right models/ path):
+    python scripts/convert_unet_safetensors.py [--model-path ./models/musetalkV15/unet.pth]
+
+The .safetensors file is written next to the .pth (same directory, same base name).
+The .pth file is NOT deleted — UNet.__init__ falls back to it automatically.
+"""
+import argparse
+import os
+import sys
+import torch
+from safetensors.torch import save_file
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert UNet .pth to .safetensors")
+    parser.add_argument("--model-path", default="./models/musetalkV15/unet.pth",
+                        help="Path to the UNet .pth weights file")
+    args = parser.parse_args()
+
+    pth_path = args.model_path
+    if not os.path.exists(pth_path):
+        print(f"ERROR: {pth_path} not found")
+        sys.exit(1)
+
+    safetensors_path = os.path.splitext(pth_path)[0] + ".safetensors"
+    if os.path.exists(safetensors_path):
+        print(f"Already exists: {safetensors_path}")
+        pth_size = os.path.getsize(pth_path)
+        st_size = os.path.getsize(safetensors_path)
+        print(f"  .pth:         {pth_size / 1e9:.2f} GB")
+        print(f"  .safetensors: {st_size / 1e9:.2f} GB")
+        return
+
+    print(f"Loading {pth_path} ({os.path.getsize(pth_path) / 1e9:.2f} GB)...")
+    state_dict = torch.load(pth_path, map_location="cpu", weights_only=False)
+
+    if not isinstance(state_dict, dict):
+        print(f"ERROR: Expected dict, got {type(state_dict)}")
+        sys.exit(1)
+
+    print(f"Saving {safetensors_path} ({len(state_dict)} tensors)...")
+    save_file(state_dict, safetensors_path)
+
+    st_size = os.path.getsize(safetensors_path)
+    print(f"Done. .safetensors: {st_size / 1e9:.2f} GB")
+
+if __name__ == "__main__":
+    main()

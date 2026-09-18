@@ -1,0 +1,52 @@
+# TASK-000B: torch.compile Quick Benchmark
+
+Date: 2026-08-26
+Hardware: NVIDIA L40S, PyTorch 2.11.0+cu128
+
+## Results (UNet, batch=8, FP16)
+
+| Mode | Compile time | Batch ms | Per-frame ms | Speedup vs eager |
+|------|-------------|----------|--------------|------------------|
+| Eager (no compile) | N/A | 31.73 | 3.97 | 1.0x |
+| `default` | 60.1s | 20.00 | 2.50 | **1.59x** |
+| `reduce-overhead` | 76.7s | 354.21 | 44.28 | 0.09x (BROKEN) |
+
+## Analysis
+
+- **`mode="default"` works well** — 1.59x speedup through kernel fusion. One-time compile
+  cost of 60s is acceptable for a long-running server process.
+
+- **`mode="reduce-overhead"` is broken** — uses CUDA Graphs internally which produce
+  incorrect timing (likely graph capture/replay overhead exceeds kernel savings for this
+  small model). The model may have dynamic control flow that breaks graph capture.
+
+- **`mode="max-autotune"` not tested** — deferred to keep within time budget. Expected to
+  be between default and reduce-overhead.
+
+## Decision
+
+**torch.compile with mode="default" gives ≥1.5x → can potentially skip CUDA Graphs (TASK-012)
+and TensorRT (TASK-013)** for the UNet. However:
+
+- UNet is only 5.8% of per-frame cost (3.6ms → 2.5ms saves 1.1ms/frame)
+- Blending at 49.7ms/frame is 20x more impactful to optimize
+- The compile_models flag already exists in the Taiboli fork
+
+The bigger question is whether torch.compile helps on **BiSeNet** (face parsing) and **VAE decode**,
+which are the actual bottlenecks. Those should be tested separately.
+
+## Per-frame budget after torch.compile on UNet
+
+| Component | Before | After | Saved |
+|-----------|--------|-------|-------|
+| UNet | 3.97 ms | 2.50 ms | 1.47 ms |
+| VAE decode | 8.57 ms | 8.57 ms | — |
+| Blending | 49.7 ms | 49.7 ms | — |
+| **Total per-frame** | **62.2 ms** | **60.8 ms** | **1.47 ms (2.4%)** |
+
+## TODO (future run)
+
+- [ ] torch.compile on VAE decoder
+- [ ] torch.compile on BiSeNet (face parsing) — biggest potential win
+- [ ] Test max-autotune mode
+- [ ] Test fullgraph=True (may fail with this UNet)

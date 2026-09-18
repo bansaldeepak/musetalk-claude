@@ -1,0 +1,13 @@
+Step 1: Use a Gateway VPC Endpoint (Crucial for Cost & Speed)Before downloading, ensure your EC2 instance is not routing traffic out to the public internet or through a NAT Gateway (which adds costs and bottlenecks). [1] (https://www.reddit.com/r/aws/comments/12fo72d/downloadupload_big_artifacts_to_s3_from_100_ec2/), [2] (https://repost.aws/knowledge-center/s3-transfer-data-bucket-instance)Create an S3 Gateway VPC Endpoint in your VPC.This creates a direct, private highway from your EC2 instance to S3 using the internal AWS backbone network. [1] (https://repost.aws/knowledge-center/s3-transfer-data-bucket-instance), [2] (https://www.reddit.com/r/aws/comments/12fo72d/downloadupload_big_artifacts_to_s3_from_100_ec2/)
+
+
+# Increase concurrent threads from 10 to 64
+aws configure set default.s3.max_concurrent_requests 64
+
+# Set chunk size to 16MB for better chunk breakdown
+aws configure set default.s3.multipart_chunksize 16MB
+aws configure set default.s3.multipart_threshold 16MB
+
+
+
+🚀 How to Remove the Disk BottleneckTo bypass the 125 MB/s speed limit and leverage your massive GPU instance network, choose one of these options: [1] (https://aws.amazon.com/ec2/instance-types/g6e/)Option A: Temp Download to Local NVMe Storage (Fastest & Free)Check if you are using an instance variant that includes local NVMe SSDs (like a g6e.4xlarge or larger). [1] (https://aws.amazon.com/ec2/instance-types/g6e/)These drives are physically attached to the server and have write speeds of several GB/s.Action: Download the file directly into the ephemeral local drive mount (usually /mnt/ephemeral or similar), process it, and bypass EBS completely.Option B: Bump Your gp3 Throughput via the AWS ConsoleYou can instantly change your EBS performance settings on the fly without rebooting or disconnecting the drive. [1] (https://hykell.com/knowledge-base/aws-ebs-throughput/)Go to the EC2 Console ➡️ Volumes.Select your 150 GB gp3 volume and click Actions ➡️ Modify Volume.Change the Throughput field from 125 MB/s to 1,000 MB/s.Run your parallel s5cmd copy command. The file will land in roughly 10 seconds. [1] (https://cloudatler.com/blog/aws-gp2-vs-gp3-the-definitive-guide-to-ebs-volume-pricing-and-performance), [2] (https://www.cloudexmachina.io/blog/ebs-pricing), [3] (https://www.reddit.com/r/aws/comments/17ucm1q/data_transfer_s3_ec2_ridiculously_slow/)

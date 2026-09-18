@@ -1,0 +1,69 @@
+---
+name: reference-repo-layout
+description: Key file paths and run commands for the MuseTalk benchmark project
+metadata: 
+  node_type: memory
+  type: reference
+  originSessionId: dd202c88-6bff-4156-afc1-7c9d41394de8
+  modified: 2026-08-25T10:17:28.339Z
+---
+
+## Repo Structure
+
+```
+/home/ubuntu/avatar-setup/
+├── MuseTalk/                    # Working copy (code changes go here)
+│   ├── .venv/                   # Python 3.12 virtualenv
+│   ├── scripts/
+│   │   ├── benchmark.py         # Benchmark harness (baseline, noise_floor, batch_scaling)
+│   │   └── inference.py         # Original inference script
+│   ├── musetalk/
+│   │   ├── models/
+│   │   │   ├── vae.py           # VAE class (encode_latents, decode_latents, get_latents_for_unet)
+│   │   │   └── unet.py          # UNet class (wraps UNet2DConditionModel), PositionalEncoding
+│   │   └── utils/
+│   │       ├── preprocessing.py # get_landmark_and_bbox, read_imgs, coord_placeholder
+│   │       ├── audio_processor.py # get_audio_feature, get_whisper_chunk
+│   │       ├── blending.py      # get_image (face blending with parsing)
+│   │       ├── face_parsing/    # BiSeNet face parsing
+│   │       └── face_detection/  # LOCAL module (not pip), needs PYTHONPATH
+│   ├── models/                  # Model weights (gitignored)
+│   ├── data/video/yongen.mp4    # Test video (10.72s, 25fps, 704x1216)
+│   ├── data/audio/eng.wav       # Test audio (60s, 16kHz mono)
+│   ├── results/
+│   │   ├── TASK-001-000.md      # First results report
+│   │   └── ground_truth/frames/ # 1500 PNG reference frames
+│   └── docs/analysis/           # Copied analysis docs
+├── Taiboli-Musetalk/            # Reference ONLY — NO edits
+└── musetalk-analysis/
+    └── BENCHMARK-TASKS.md       # Master execution plan
+```
+
+## Running the Benchmark
+
+```bash
+cd /home/ubuntu/avatar-setup/MuseTalk
+source .venv/bin/activate
+PYTHONPATH=musetalk/utils:$PYTHONPATH python scripts/benchmark.py --mode baseline --runs 3
+PYTHONPATH=musetalk/utils:$PYTHONPATH python scripts/benchmark.py --mode noise_floor
+PYTHONPATH=musetalk/utils:$PYTHONPATH python scripts/benchmark.py --mode batch_scaling
+```
+
+## Running Original Inference
+
+```bash
+cd /home/ubuntu/avatar-setup/MuseTalk
+source .venv/bin/activate
+PYTHONPATH=musetalk/utils:$PYTHONPATH python -m scripts.inference \
+  --inference_config configs/inference/test.yaml \
+  --result_dir results/test --use_float16 --version v15
+```
+
+## Key API Facts
+
+- UNet input: latent [batch, 8, 32, 32] (masked + ref concatenated), conditioning [batch, 50, 384]
+- Single-step inpainting (timestep=0), NOT iterative diffusion
+- PositionalEncoding `pe()` applied to whisper chunks BEFORE passing to UNet
+- `vae.get_latents_for_unet(crop_frame)` does: preprocess → encode masked → encode ref → cat dim=1
+- `vae.decode_latents(pred)` does: scale → decode → clamp → to uint8 BGR numpy
+- Audio: `get_audio_feature` → whisper encoder → `get_whisper_chunk` → rearrange to [T, 50, 384]

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+MODELS_DIR="${MODELS_DIR:-/app/models}"
+S3_WEIGHTS_URI="${S3_WEIGHTS_URI:-}"
+
+weights_present() {
+  local required=(
+    musetalk/musetalk.json
+    musetalk/pytorch_model.bin
+    musetalkV15/musetalk.json
+    musetalkV15/unet.pth
+    syncnet/latentsync_syncnet.pt
+    dwpose/dw-ll_ucoco_384.pth
+    s3fd/s3fd.pth
+    face-parse-bisent/79999_iter.pth
+    face-parse-bisent/resnet18-5c106cde.pth
+    sd-vae/config.json
+    sd-vae/diffusion_pytorch_model.safetensors
+    whisper/config.json
+    whisper/pytorch_model.bin
+    whisper/preprocessor_config.json
+  )
+
+  for file in "${required[@]}"; do
+    [ -s "$MODELS_DIR/$file" ] || return 1
+  done
+}
+
+blank_mode() {
+  case "$(printf '%s' "${AVATAR_BLANK_MODE:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  # Also honour the CLI flag, so `docker run <image> --blank_avatar` works on an
+  # image that wasn't built with the env baked in.
+  local arg
+  for arg in "$@"; do
+    [ "$arg" = "--blank_avatar" ] && return 0
+  done
+  return 1
+}
+
+if blank_mode "$@"; then
+  # Blank-avatar dev mode renders no avatar, so it loads no models. Requiring
+  # weights here would make the CPU image — which deliberately ships neither the
+  # weights nor the model stack that reads them — refuse to start.
+  echo "[entrypoint] Blank-avatar mode: skipping model weight provisioning"
+elif weights_present; then
+  echo "[entrypoint] Model weights found at $MODELS_DIR"
+elif [ -n "$S3_WEIGHTS_URI" ]; then
+  echo "[entrypoint] Downloading weights from S3: $S3_WEIGHTS_URI"
+  aws s3 sync "$S3_WEIGHTS_URI" "$MODELS_DIR" --quiet
+  echo "[entrypoint] S3 download complete"
+else
+  echo "[entrypoint] ERROR: No weights at $MODELS_DIR and S3_WEIGHTS_URI not set"
+  echo "[entrypoint] Either mount weights volume or set S3_WEIGHTS_URI=s3://bucket/models"
+  if [ ! -d /app/.venv/lib/python3.11/site-packages/musetalk ] \
+     && ! /app/.venv/bin/python -c "import transformers" >/dev/null 2>&1; then
+    echo "[entrypoint] NOTE: this looks like the CPU blank-avatar image (no model stack installed)."
+    echo "[entrypoint] It can only run in blank mode. AVATAR_BLANK_MODE was ${AVATAR_BLANK_MODE:-unset}."
+  fi
+  exit 1
+fi
+
+# Pre-warm model files into page cache in the BACKGROUND while Python starts.
+# Python spends ~4-9s importing before it touches model files. The background
+# reads overlap with that import time, so by the time torch.load runs the data
+# is already in page cache (memory speed) instead of waiting for EBS.
+if ! blank_mode "$@"; then
+  echo "[entrypoint] Pre-warming model files into page cache (background)..."
+  (
+    for f in \
+      "$MODELS_DIR/musetalkV15/unet.safetensors" \
+      "$MODELS_DIR/musetalkV15/unet.pth" \
+      "$MODELS_DIR/sd-vae/diffusion_pytorch_model.safetensors" \
+      "$MODELS_DIR/whisper/pytorch_model.bin"; do
+      [ -f "$f" ] && cat "$f" > /dev/null &
+    done
+    wait
+    echo "[entrypoint] Page cache warm"
+  ) &
+fi
+
+echo "[entrypoint] Starting main_server.py $*"
+exec python main_server.py "$@"

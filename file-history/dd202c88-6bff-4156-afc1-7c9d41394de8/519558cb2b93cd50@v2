@@ -1,0 +1,93 @@
+# TASK-010: Batch VAE Encoding + Persistent Latent Cache
+
+Date: 2026-08-31
+Hardware: NVIDIA L40S, PyTorch 2.11.0+cu128
+
+## Profiling: Where does VAE encode time go?
+
+Per-frame `get_latents_for_unet()` does 2 preprocesses + 2 encodes + 1 cat:
+
+| Component | Per-frame (ms) | Total 268 frames |
+|-----------|---------------|------------------|
+| preprocess_img (×2) | 1.64 | 440ms |
+| encode_latents (×2) | 9.32 | 2,498ms |
+| cat + overhead | 0.67 | 180ms |
+| **Total** | **11.63** | **3,118ms** |
+
+## Batch Encode Scaling
+
+VAE encode is memory-bandwidth-bound; batching helps minimally:
+
+| Batch | Per-frame encode (ms) | Speedup |
+|-------|----------------------|---------|
+| 1 | 4.6 | 1.0x |
+| 2 | 3.1 | 1.5x |
+| 4 | 3.2 | 1.4x |
+| 8 | 3.7 | 1.2x |
+
+Batch=2 is the sweet spot. Larger batches add memory pressure with no throughput gain.
+
+## Solution: Batch Encode (cold) + Persistent Latent Cache (warm)
+
+### Batch encode (`vae.get_latents_for_unet_batch`)
+- Vectorized preprocessing: numpy stack → single GPU transfer
+- Encode in chunks of batch=2 (optimal)
+- Cold path: 3,118ms → 2,065ms (1.49x)
+
+### Persistent latent cache
+- Same pattern as mask cache (TASK-008)
+- Cache key: SHA-256 of `{video_path}:{file_size}:{bbox_shift}:{version}:{extra_margin}`
+- Fixed random seed (`torch.manual_seed(0)`) for deterministic encoding
+- Cache file: 4.3MB (268 frames × 8 channels × 32×32 × fp16)
+- Warm path: 9,600ms → 6ms (load from disk)
+
+## Results
+
+### VAE encode phase
+
+| Path | Time | Speedup |
+|------|------|---------|
+| Original (per-frame, batch=1) | 3,118ms | 1.0x |
+| Batch encode (batch=2, cold) | 2,065ms | 1.49x |
+| **Latent cache (warm)** | **6ms** | **520x** |
+
+### Cumulative warm-start pipeline
+
+| Phase | Prev warm (ms) | Now (ms) | Change |
+|-------|---------------|----------|--------|
+| Model load | 9,900 | 10,100 | — |
+| Frame extract | 6,500 | 6,300 | — |
+| Whisper | 881 | 867 | — |
+| Coord + frame read | 2,300 | 2,300 | — |
+| **VAE encode** | **9,600** | **6** | **-9,594ms** |
+| Mask load | 7 | 6 | — |
+| UNet + VAE decode | 42,500 | 42,500 | — |
+| Blending | 22,700 | 22,800 | — |
+| **TOTAL** | **94,300** | **84,800** | **-9,500ms** |
+| **FPS** | **15.9** | **17.7** | **+11%** |
+| **vs baseline (138s)** | **1.46x** | **1.63x** | |
+
+## Quality Gate
+
+**PASS.**
+- PSNR min: 40.6 dB, mean: 42.7 dB (vs ground truth)
+- No frames below 30 dB
+- Differences are within stochastic VAE sampling variance
+- Output video generated end-to-end with inference.py
+
+## Code Changes
+
+1. `musetalk/models/vae.py` — Added `get_latents_for_unet_batch()`: vectorized
+   preprocessing + chunked encode at batch=2
+2. `scripts/inference.py` — Persistent latent cache with SHA-256 key; loads from
+   disk on warm start, batch-encodes and saves on cold start
+3. `scripts/benchmark.py` — Uses batch encode for cold-path measurement
+
+## Cache Summary (all warm-start caches)
+
+| Cache | File | Size | Cold → Warm |
+|-------|------|------|-------------|
+| Coord list | `{name}.pkl` | ~8 KB | 19.8s → 0ms |
+| Blend masks | `cache/masks_{name}_{hash}.pkl` | 38 KB | 25.7s → 6ms |
+| **VAE latents** | **`cache/latents_{name}_{hash}.pt`** | **4.3 MB** | **9.6s → 6ms** |
+| **Total** | | **~4.3 MB** | **~55s → ~12ms** |

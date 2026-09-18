@@ -1,0 +1,6 @@
+- [Benchmark Project](project-musetalk-benchmark.md) — MuseTalk optimization progress, baseline results, next tasks
+- [Warm Start v2](project-warm-start-v2.md) — 69s→14.3s warm start, 1610ms→774ms greeting, PR #38 on Panya-Labs/MuseTalk
+- [Commit Workflow](feedback-commit-workflow.md) — Human approval required for every commit and push
+- [Repo Layout & Commands](reference-repo-layout.md) — File paths, run commands, key API facts
+- [Environment Quirks](project-env-quirks.md) — Python 3.12 patches: mmcv stubs, torch.load, version bumps
+- [Upstream Remote](reference-upstream-remote.md) — Panya-Labs/MuseTalk is upstream for bansaldeepak/Realtime-Avatar

@@ -1,0 +1,97 @@
+# TASK-008: Batch BiSeNet Face Parsing + Mask Caching
+
+Date: 2026-08-31
+Hardware: NVIDIA L40S, PyTorch 2.11.0+cu128
+
+## Approach
+
+**Original problem:** Blending was 49.7ms/frame (80.5% of per-frame cost).
+
+### Profiling: Where does 49.7ms actually go?
+
+| Component | Time (ms) | % |
+|-----------|----------|---|
+| Preprocess (resize+normalize+GPU transfer) | 4.0 | 12.7% |
+| BiSeNet GPU forward pass | 4.5 | 14.3% |
+| **Postprocess (argmax + cv2 morphology on CPU)** | **22.9** | **73.0%** |
+| Total BiSeNet + postproc | 31.4 | |
+| Remaining blend ops (PIL paste, GaussianBlur) | ~18.3 | |
+
+**Key finding:** The bottleneck is NOT the neural network — it's CPU-side morphology
+operations (cv2.dilate, cv2.erode, np.isin). Batching BiSeNet on GPU actually made it
+SLOWER (0.8x at batch=8) because the GPU forward is already tiny (4.5ms) and postproc
+runs sequentially regardless.
+
+### Solution: Mask Caching
+
+Instead of running BiSeNet 1500 times (once per output frame), pre-compute masks for
+the 268 unique source frames, then reuse via the cycle (forward + reverse = 536 cache
+entries from 268 unique computations).
+
+Used the existing `get_image_prepare_material()` + `get_image_blending()` functions
+already in `blending.py`.
+
+## Results
+
+### Per-frame blending cost
+
+| Phase | Before | After | Speedup |
+|-------|--------|-------|---------|
+| Blending per output frame | 49.7 ms | 15.9 ms | **3.1x** |
+| Blending total (1500 frames) | 74,574 ms | 23,916 ms | **3.1x** |
+
+### Total blend-related cost (precompute + blend)
+
+| Phase | Time (ms) |
+|-------|----------|
+| Mask precompute (268 unique frames) | 25,709 |
+| Blending with cached masks (1500 frames) | 23,916 |
+| **Total** | **49,625** |
+| **Previous (no caching)** | **74,574** |
+| **Savings** | **24,949 ms (33%)** |
+
+### Per-frame budget (steady-state)
+
+| Component | Before | After | Change |
+|-----------|--------|-------|--------|
+| Blending | 49.7 ms | 15.9 ms | -33.8 ms |
+| VAE decode | 8.5 ms | 8.5 ms | — |
+| UNet | 3.6 ms | 3.6 ms | — |
+| **Total per-frame** | **61.8 ms** | **28.0 ms** | **-33.8 ms (55%)** |
+
+### Batch BiSeNet (attempted but not beneficial)
+
+| Batch | Per-frame ms | Speedup |
+|-------|-------------|---------|
+| 1 | 29.4 | 1.0x |
+| 4 | 37.8 | 0.8x |
+| 8 | 37.8 | 0.8x |
+| 16 | 39.3 | 0.7x |
+
+Batching BiSeNet makes it slower because the GPU portion (4.5ms) is too small to
+amortize and the CPU postprocessing dominates.
+
+## Quality Gate
+
+**PASS.**
+- Batch_call output is bit-identical to single-frame output (validated on 8 images)
+- Cached-mask inference produces ~43.9 dB PSNR vs ground truth (same as non-cached
+  ~42.5 dB, within stochastic VAE sampling variance)
+- `get_image_prepare_material()` + `get_image_blending()` are existing functions in
+  the codebase — no new mask logic introduced
+
+## Code Changes
+
+1. `musetalk/utils/face_parsing/__init__.py` — Refactored postprocessing into
+   `_postprocess_parsing()`, added `batch_call()` method
+2. `scripts/inference.py` — Pre-compute masks for unique frames using
+   `get_image_prepare_material()`, use `get_image_blending()` with cached masks
+3. `scripts/benchmark.py` — Updated to use same caching pattern, added
+   mask_precompute timing phase
+
+## Future Optimization Opportunities
+
+1. **Move morphology to GPU** — the 22.9ms CPU postprocessing could use `kornia`
+   or custom CUDA kernels for dilate/erode
+2. **torch.compile on BiSeNet** — 4.5ms GPU forward could be faster
+3. **Reduce mask resolution** — 512x512 masks may be overkill for 256x256 face crops

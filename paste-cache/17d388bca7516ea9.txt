@@ -1,0 +1,75 @@
+## Diagnose it in 3 commands
+
+Run these before changing anything. They tell you which of the three
+bottlenecks (disk, CPU, or network path) is actually hurting you.
+
+**1. Test network + CPU only, no disk involved**
+
+```bash
+time s5cmd cat s3://bucket/bigfile.npy > /dev/null
+```
+
+**2. Watch CPU while the transfer runs (use a second terminal)**
+
+```bash
+mpstat -P ALL 1
+```
+
+**3. Confirm the S3 Gateway VPC Endpoint exists**
+
+```bash
+aws ec2 describe-vpc-endpoints \
+  --filters Name=service-name,Values=com.amazonaws.$AWS_REGION.s3
+```
+
+### How to read the result
+
+| What you see | What it means |
+|---|---|
+| Step 1 much faster than 430 MB/s | Disk is the bottleneck |
+| Step 1 also ~430 MB/s and CPU near 100% | CPU bound (TLS + checksum on 4 vCPUs) |
+| Step 3 returns nothing | Traffic is going through NAT Gateway |
+
+---
+
+## Fixes that actually work
+
+### 1. Stop writing to EBS
+
+g6e.xlarge EBS caps at 625 MB/s max, 125 MB/s baseline. The instance
+ships with a 250 GB local NVMe drive. Use that instead.
+
+```bash
+sudo mkfs.xfs /dev/nvme1n1
+sudo mkdir -p /mnt/models
+sudo mount /dev/nvme1n1 /mnt/models
+```
+
+Or skip disk completely — 10 GB fits inside your 32 GiB of RAM:
+
+```bash
+sudo mount -t tmpfs -o size=16G tmpfs /mnt/models
+```
+
+### 2. Tune s5cmd properly
+
+Defaults are 256 workers but only 5 concurrent parts at 50 MB each.
+
+```bash
+s5cmd --numworkers 256 cp \
+  --concurrency 32 \
+  --part-size 32 \
+  's3://bucket/models/*' /mnt/models/
+```
+
+### 3. Add the S3 Gateway VPC Endpoint
+
+It is free and it removes NAT Gateway from the path. NAT caps a single
+flow at 5 Gbps and charges you per GB.
+
+---
+
+### Expected result
+
+NVMe (or tmpfs) + tuned s5cmd + gateway endpoint gives you roughly
+**6-10 seconds** for 10 GB. Around **4-5 seconds** if burst credits are full.

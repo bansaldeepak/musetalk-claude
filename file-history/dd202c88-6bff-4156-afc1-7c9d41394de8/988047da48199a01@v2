@@ -1,0 +1,98 @@
+# TASK-009: Batch DWPose Landmark Detection + S3FD Optimization
+
+Date: 2026-08-31
+Hardware: NVIDIA L40S, PyTorch 2.11.0+cu128
+
+## Profiling: Where does 19.8s go?
+
+| Component | Per-frame (ms) | Total 268 frames (ms) | % |
+|-----------|---------------|----------------------|---|
+| S3FD face detection | 42.1 | 11,283 | 64.5% |
+| DWPose landmarks | 21.8 | 5,842 | 33.4% |
+| Combine results | ~0.02 | ~5 | ~0% |
+| Image reading | ~9.4 | 2,520 | |
+
+S3FD (face bounding box) is 2x more expensive than DWPose (facial landmarks).
+
+## Batching Investigation
+
+### DWPose (mmpose RTMPose)
+- Raw backbone scales beautifully: batch=1 → batch=16 gives **10.7x speedup** (9.6→0.9ms/frame)
+- BUT: mmpose's `inference_topdown` API has massive per-call overhead (~60ms/frame at batch=16 via `test_step`)
+- The overhead is in data pipeline preprocessing (affine transform) and postprocessing (SimCC decode, data sample construction)
+- Bypassing the API requires reimplementing the affine coordinate mapping, which is error-prone
+- **Verdict: batch DWPose via mmpose API not viable without custom model wrapper**
+
+### S3FD (face detection)
+- Full-resolution (1216x704) batching makes it SLOWER: batch=8 is 0.4x (2.5x slower)
+- Root cause: S3FD processes at full input resolution, large feature maps at batch>1 hit memory bandwidth limits
+- **Verdict: S3FD batching not viable at full resolution**
+
+## Solution: S3FD Downscaling
+
+S3FD is only used as a fallback when DWPose landmarks produce invalid bboxes. In practice,
+DWPose always produces valid landmarks for our test video (0 fallbacks out of 268 frames).
+
+Downscaling input images to 0.5x before S3FD:
+
+| Scale | Per-frame (ms) | Speedup | Detection rate |
+|-------|---------------|---------|---------------|
+| 1.0x (704x1216) | 43.6 | 1.0x | 268/268 |
+| 0.75x (528x912) | 24.9 | 1.8x | 268/268 |
+| **0.5x (352x608)** | **12.7** | **3.4x** | **268/268** |
+
+### Bbox accuracy at 0.5x
+
+| Metric | Value |
+|--------|-------|
+| Max diff per coordinate | 17 px |
+| Mean diff per coordinate | 8.6 px |
+| Max diff as % of bbox size | 7% |
+| Final coord_list match vs full-res | **268/268 identical** |
+
+The final coordinates are **identical** because DWPose landmarks (not S3FD bboxes) determine
+the actual crop coordinates. S3FD is only the fallback for invalid landmarks.
+
+## Additional Optimization: Separated Passes
+
+Original code interleaved DWPose + S3FD per frame. Separating into independent passes
+improves GPU utilization (no context switching between models).
+
+## Results
+
+### Face detection phase (268 frames)
+
+| Approach | Total (ms) | Per-frame (ms) | Speedup |
+|----------|-----------|---------------|---------|
+| Original (interleaved, full-res S3FD) | 17,478 | 65.2 | 1.0x |
+| **Optimized (separated, 0.5x S3FD)** | **9,337** | **34.8** | **1.87x** |
+
+### Breakdown (optimized)
+
+| Phase | Time (ms) | Per-frame (ms) |
+|-------|----------|---------------|
+| S3FD at 0.5x | 3,837 | 14.3 |
+| DWPose at batch=1 | 5,499 | 20.5 |
+
+## Quality Gate
+
+**PASS.**
+- Final coord_list is 268/268 identical to original (full-res) output
+- Face landmarks from DWPose are unchanged (same model, same input, same resolution)
+- S3FD bbox differences (max 17px) never affect output because DWPose always
+  produces valid landmarks for this avatar video
+
+## Code Changes
+
+1. `musetalk/utils/preprocessing.py` — Restructured `get_landmark_and_bbox()`:
+   separate S3FD and DWPose into independent passes, S3FD at configurable
+   `s3fd_scale` (default 0.5x)
+
+## Notes
+
+- **Coord caching already exists**: `--use_saved_coord` skips the entire face
+  detection phase on subsequent sessions. This optimization only affects the
+  first-run cold start per avatar video.
+- **DWPose backbone batching is proven fast** (0.9ms/frame at batch=16) but
+  blocked by mmpose API overhead. A custom model wrapper bypassing `test_step`
+  could unlock another ~3x, but requires reimplementing affine coordinate decode.

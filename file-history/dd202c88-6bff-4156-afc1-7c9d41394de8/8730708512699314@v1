@@ -1,0 +1,4 @@
+- [Benchmark Project](project-musetalk-benchmark.md) — MuseTalk optimization progress, baseline results, next tasks
+- [Commit Workflow](feedback-commit-workflow.md) — Human approval required for every commit and push
+- [Repo Layout & Commands](reference-repo-layout.md) — File paths, run commands, key API facts
+- [Environment Quirks](project-env-quirks.md) — Python 3.12 patches: mmcv stubs, torch.load, version bumps

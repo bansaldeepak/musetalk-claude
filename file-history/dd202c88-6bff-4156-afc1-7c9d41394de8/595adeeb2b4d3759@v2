@@ -1,0 +1,119 @@
+# TASK-002: Baseline Timing + Noise Floor + Batch Scaling
+
+Date: 2026-08-26
+Hardware: NVIDIA L40S (44.4 GB VRAM)
+Stack: Python 3.12.3, PyTorch 2.11.0+cu128
+Test pair: data/video/yongen.mp4 (10.72s, 25fps) + data/audio/eng.wav (60s)
+Output: 1500 frames at 25fps
+
+## Baseline Timing (median of 3 runs, batch_size=8)
+
+| Phase | Median (ms) | Min (ms) | Max (ms) |
+|-------|-------------|----------|----------|
+| Model loading | 12,880 | 7,323 | 14,992 |
+| Frame extraction (ffmpeg) | 6,319 | 6,273 | 6,462 |
+| Whisper audio features | 39 | 28 | 1,999 |
+| Face detect + landmarks | 19,840 | 19,780 | 49,917 |
+| VAE encode (all frames) | 3,918 | 3,484 | 10,199 |
+| Inference total (UNet+VAE dec) | 18,559 | 18,395 | 62,906 |
+| — UNet total | 5,445 | 5,363 | 36,772 |
+| — UNet per frame | 3.6 | 3.6 | 24.5 |
+| — UNet median batch (8 frames) | 28.2 | 28.1 | 28.5 |
+| — UNet p99 batch | 38.6 | 34.9 | 2,075 |
+| — VAE decode total | 12,679 | 12,628 | 25,753 |
+| — VAE decode per frame | 8.5 | 8.4 | 17.2 |
+| Blending total | 74,574 | 73,681 | 88,115 |
+| — Blending per frame | 49.7 | 49.1 | 58.7 |
+| **TOTAL PIPELINE** | **138,016** | **134,744** | **226,919** |
+| **Effective FPS** | **10.9** | | |
+
+### VRAM Usage
+
+| Metric | Value |
+|--------|-------|
+| After model load | 7,065 MB |
+| Peak during inference | 36,157 MB |
+
+### Per-Frame Cost Breakdown (steady-state)
+
+| Component | ms/frame | % of per-frame |
+|-----------|----------|----------------|
+| Blending (face parse + composite) | 49.7 | 80.5% |
+| VAE decode | 8.5 | 13.8% |
+| UNet forward | 3.6 | 5.8% |
+| **Total per-frame** | **61.8** | |
+
+**Key finding:** Blending dominates per-frame cost at 80.5%. The UNet (the usual suspect
+in diffusion pipelines) is only 5.8% of per-frame cost. This confirms the Taiboli fork
+analysis — the render path (UNet) is not the bottleneck.
+
+## Noise Floor
+
+| Metric | Value |
+|--------|-------|
+| Frames compared | 1500 |
+| Bit-identical | 1500/1500 (100%) |
+| PSNR | inf (all identical) |
+| SSIM | 1.000000 |
+
+**Pipeline is fully deterministic.** Any measured PSNR < inf after an optimization
+represents a REAL quality regression, not measurement noise. The quality gate has
+no noise floor to account for.
+
+## Batch Scaling (TASK-003)
+
+UNet and VAE decode measured at batch sizes 1, 2, 4, 8, 16 (100 iterations each,
+20 warmup, synthetic random tensors, FP16).
+
+### UNet Batch Scaling
+
+| Batch | Total (ms) | Per-frame (ms) | p99/frame (ms) | Speedup vs batch=1 |
+|-------|-----------|----------------|----------------|---------------------|
+| 1 | 28.4 | 28.4 | 36.1 | 1.0x |
+| 2 | 28.8 | 14.4 | 17.9 | 2.0x |
+| 4 | 28.5 | 7.1 | 8.2 | 4.0x |
+| 8 | 28.8 | 3.6 | 4.0 | 7.9x |
+| 16 | 33.9 | 2.1 | 2.3 | 13.4x |
+
+**UNet scales near-perfectly** up to batch 8 (same total time regardless of batch size,
+implying the GPU is severely underutilized at batch=1). Batch 16 shows only 20% overhead
+vs batch 1, achieving 13.4x throughput improvement per frame.
+
+### VAE Decode Batch Scaling
+
+| Batch | Total (ms) | Per-frame (ms) | Speedup vs batch=1 |
+|-------|-----------|----------------|---------------------|
+| 1 | 9.1 | 9.1 | 1.0x |
+| 2 | 15.8 | 7.9 | 1.2x |
+| 4 | 31.7 | 7.9 | 1.2x |
+| 8 | 68.6 | 8.6 | 1.1x |
+| 16 | 138.4 | 8.7 | 1.1x |
+
+**VAE decode does NOT benefit from batching.** Cost is nearly linear with batch size
+(memory-bandwidth bound). Per-frame cost is flat at ~8-9ms regardless of batch size.
+
+## Decision Gate: Where to Focus Optimization
+
+Based on these measurements, the optimization priority should be:
+
+1. **Blending (49.7ms/frame)** — by far the biggest per-frame cost. Face parsing
+   (BiSeNet forward pass) + image compositing. Candidates: torch.compile on BiSeNet,
+   pre-compute masks, simplify blending logic, GPU-accelerated compositing.
+
+2. **VAE decode (8.5ms/frame)** — second largest. Does not batch. Candidates:
+   torch.compile, TensorRT, reduced precision.
+
+3. **Face detection + landmarks (19.8s one-time)** — large startup cost but amortized
+   over session. Candidates: cache coordinates, reduce frame count.
+
+4. **UNet (3.6ms/frame at batch=8)** — already very fast and scales well. Low priority
+   for optimization unless targeting sub-2ms latency. Already benefits from SDPA/Flash
+   Attention.
+
+## Success Criteria Verification
+
+- [x] Per-phase CUDA event timing for all pipeline stages
+- [x] Noise floor established (deterministic = no floor)
+- [x] Batch scaling curve for UNet and VAE decode
+- [x] Ground truth frames available for quality comparison
+- [x] Baseline numbers reproducible (3-run median with min/max)

@@ -1,0 +1,59 @@
+# TASK-003: Batch Scaling Curve
+
+Date: 2026-08-26
+Hardware: NVIDIA L40S (44.4 GB VRAM)
+Stack: Python 3.12.3, PyTorch 2.11.0+cu128
+Method: 100 iterations per batch size, 20 warmup, synthetic random FP16 tensors
+
+## UNet Batch Scaling
+
+Input shape: [batch, 8, 32, 32] latent + [batch, 50, 384] audio conditioning.
+Single-step (timestep=0).
+
+| Batch | Total (ms) | Per-frame (ms) | p99/frame (ms) | Speedup vs batch=1 |
+|-------|-----------|----------------|----------------|---------------------|
+| 1 | 28.4 | 28.4 | 36.1 | 1.0x |
+| 2 | 28.8 | 14.4 | 17.9 | 2.0x |
+| 4 | 28.5 | 7.1 | 8.2 | 4.0x |
+| 8 | 28.8 | 3.6 | 4.0 | 7.9x |
+| 16 | 33.9 | 2.1 | 2.3 | 13.4x |
+
+**Analysis:** UNet batch time is nearly constant from batch 1 to 8 (~28ms), meaning
+the GPU is severely underutilized at small batch sizes. At batch 16 there's only 20%
+overhead, achieving 13.4x per-frame throughput improvement. The L40S has ample compute
+headroom for this model.
+
+## VAE Decode Batch Scaling
+
+Input shape: [batch, 4, 32, 32] latent.
+
+| Batch | Total (ms) | Per-frame (ms) | Speedup vs batch=1 |
+|-------|-----------|----------------|---------------------|
+| 1 | 9.1 | 9.1 | 1.0x |
+| 2 | 15.8 | 7.9 | 1.2x |
+| 4 | 31.7 | 7.9 | 1.2x |
+| 8 | 68.6 | 8.6 | 1.1x |
+| 16 | 138.4 | 8.7 | 1.1x |
+
+**Analysis:** VAE decode scales linearly with batch size — no throughput gain from
+batching. This is a memory-bandwidth-bound operation. Per-frame cost is flat at ~8-9ms.
+Optimization must come from compilation (torch.compile/TensorRT), not batching.
+
+## Implications for Optimization
+
+1. **UNet batching is free throughput** — already exploited at batch_size=8 in the
+   default pipeline. Going to 16 would save another 1.5ms/frame but doubles VRAM.
+
+2. **VAE decode is the batching-resistant bottleneck** — torch.compile or TensorRT
+   are the paths forward here, not larger batch sizes.
+
+3. **Current batch_size=8 is near-optimal** — 7.9x speedup on UNet with manageable
+   VRAM. Batch 16 offers diminishing returns (13.4x vs 7.9x) at 2x memory cost.
+
+## Reproduction
+
+```bash
+cd /home/ubuntu/avatar-setup/MuseTalk
+source .venv/bin/activate
+PYTHONPATH=musetalk/utils:$PYTHONPATH python scripts/benchmark.py --mode batch_scaling
+```

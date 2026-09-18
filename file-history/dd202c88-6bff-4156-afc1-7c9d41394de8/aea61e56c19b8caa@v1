@@ -1,0 +1,72 @@
+---
+name: reference-repo-layout
+description: Key file paths and run commands for the Realtime-Avatar (production) and MuseTalk (benchmark fork) repos
+metadata: 
+  node_type: memory
+  type: reference
+  originSessionId: dd202c88-6bff-4156-afc1-7c9d41394de8
+  modified: 2026-09-02T00:40:55.085Z
+---
+
+## Repo Structure
+
+```
+/home/ubuntu/avatar-setup/
+├── Realtime-Avatar/              # Production repo (ALL future work goes here)
+│   ├── main_server.py            # Production WebRTC server (4.8k lines)
+│   ├── musetalk/                 # Model code (mostly vendored upstream)
+│   │   ├── models/
+│   │   │   ├── vae.py            # VAE class + decode_latents_tensor + TAESD support
+│   │   │   └── unet.py           # UNet class (3.2GB .pth via torch.load)
+│   │   └── utils/
+│   │       ├── preprocessing.py  # Eager DWPose/S3FD import at module level (needs lazy loading)
+│   │       ├── blending.py       # get_image_prepare_material
+│   │       └── face_parsing/     # BiSeNet face parsing
+│   ├── documentation/
+│   │   ├── optimization-benchmarks/  # Results from MuseTalk fork benchmarks
+│   │   └── architecture/         # rendering.md, voice-and-protocol.md, operations.md, etc.
+│   ├── STARTUP-PERF.md           # Comprehensive warm/cold start analysis and plan
+│   ├── AGENTS.md                 # Repo orientation for AI agents
+│   ├── benchmark.py              # Production benchmark harness
+│   └── tests/                    # test_relay_protocol.py, test_mic_gate.py, test_blank_avatar.py
+├── MuseTalk/                     # Benchmark fork (reference only now)
+│   ├── .venv/                    # Python 3.12 virtualenv
+│   ├── scripts/benchmark.py      # Fork's benchmark harness
+│   ├── results/TASK-*.md         # Benchmark results (copied to Realtime-Avatar/documentation/)
+│   └── docs/analysis/            # Analysis docs (also copied)
+```
+
+## Docker Container (running production)
+
+```bash
+# The production server runs in Docker
+docker exec musetalk <command>    # Run commands inside the container
+docker logs musetalk              # View server logs
+
+# Model weights inside container
+# /app/models/musetalkV15/unet.pth (3.2GB, .pth format — bottleneck)
+# /app/models/sd-vae/ (320MB, already .safetensors)
+# /app/models/whisper/ (145MB, pytorch_model.bin)
+# /app/models/dwpose/dw-ll_ucoco_384.pth (389MB)
+
+# Avatar runtime cache inside container
+# /app/results/v15/avatars/avator_1/runtime/rgb_frames.npy (2.8GB, mmap)
+# /app/results/v15/avatars/avator_1/runtime/idle_frames.npy (2.8GB, mmap)
+# /app/results/v15/avatars/avator_1/runtime/alpha.npy (94MB)
+# /app/results/v15/avatars/avator_1/latents.pt (15MB)
+```
+
+## Key Production Classes (main_server.py)
+
+- `MuseTalkAvatar`: avatar cache, runtime geometry, idle frames, blend params
+- `MuseTalkEngine`: model loading, initialize(), build_idle_cycle(), warmup(), render_batch()
+- `AzureRealtimeSession`: WebRTC + GPT Realtime voice loop
+- `ServerConfig`: all config flags (compile_models, vae_decoder, etc.)
+
+## Key API Facts
+
+- UNet input: latent [batch, 8, 32, 32] (masked + ref concatenated), conditioning [batch, 50, 384]
+- Single-step inpainting (timestep=0), NOT iterative diffusion
+- Production blend: `(alpha * face_inter) + base_part` — simple numpy, NOT BiSeNet+morphology
+- Production decode: `decode_latents_tensor()` keeps data on GPU as uint8 tensor
+- Runtime cache uses np.load(mmap_mode="r") for 2.8GB rgb_frames.npy

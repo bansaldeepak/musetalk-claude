@@ -1,0 +1,41 @@
+# Optimization Benchmarks (from MuseTalk fork)
+
+Benchmarks and results from `bansaldeepak/MuseTalk` branch `perf/optimization-benchmarks`.
+These were measured on the same g6e.xlarge (L40S) hardware as production.
+
+## What was measured (CLI batch pipeline, 268-frame test video)
+
+| Task | What | Result | Migrates to production? |
+|------|------|--------|------------------------|
+| TASK-001/000 | Environment setup + baseline | 138s baseline | N/A |
+| TASK-002 | Detailed timing breakdown | Per-phase profiling | Reference data |
+| TASK-003 | Batch scaling analysis | Batch=4 optimal for UNet (14.1ms/frame) | Yes — production already uses batch=4 |
+| TASK-004 | Remove TensorFlow | Import 12s → 3s | **Yes — direct port** |
+| TASK-005 | Safetensors UNet | Load 6.1s → 3.0s (2x) | **Yes — biggest warm-start win** |
+| TASK-000B | torch.compile | 2.4x decode speedup (compile cost: 121s) | Already in production (env-gated) |
+| TASK-008 | Mask caching + persistent disk cache | 25.7s → 6ms (warm) | Already cached in production |
+| TASK-009 | S3FD downscaling (0.5x) | Face detection 2.8x faster | **Yes — cold-start speedup** |
+| TASK-010 | Batch VAE encode + latent cache + lazy model loading | 94s → 63s overall | **Partial — batch VAE for cold start, lazy loading for warm start** |
+
+## What directly migrates to production
+
+### Warm start (27s → target 2-3s)
+1. **Safetensors UNet** (TASK-005): 3.2GB .pth → safetensors = ~2x faster model load
+2. **Lazy DWPose/S3FD import** (TASK-010): Production `preprocessing.py` still loads at import time
+3. **Remove TensorFlow** (TASK-004): Already documented in STARTUP-PERF.md
+
+### Cold start (7min → target 10-15s)
+1. **S3FD downscaling** (TASK-009): Face detection at 0.5x resolution = 2.8x faster
+2. **Batch VAE encode** (TASK-010): encode_batch_size=2 optimal (1.5x), batch=4+ slower (memory-bandwidth-bound)
+
+### What does NOT migrate
+- Mask caching (TASK-008): Production already has runtime geometry cache
+- Coord caching: Production already caches coords.pkl
+- CLI-specific pipeline: Production is a persistent server, not batch CLI
+
+## Key findings that inform production work
+
+1. **VAE encode is memory-bandwidth-bound**: batch=2 is optimal, larger batches are SLOWER
+2. **DWPose dominates skippable load time**: 5.4s of the import phase is DWPose alone
+3. **Freed GPU memory speeds UNet+VAE decode**: Not loading DWPose dropped decode from 42.5s → 20.5s
+4. **UNet at 3.2GB .pth is the single biggest warm-start bottleneck**: safetensors mmap would be transformative

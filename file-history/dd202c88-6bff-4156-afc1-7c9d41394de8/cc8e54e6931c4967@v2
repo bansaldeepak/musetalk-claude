@@ -1,0 +1,30 @@
+# TASK-004: Remove TensorFlow
+
+Date: 2026-08-26
+
+## Change
+
+Removed `tensorflow==2.12.0` and `tensorboard==2.12.0` from `requirements.txt`.
+
+## Justification
+
+1. **No imports:** `grep -rn "import tensorflow" --include="*.py"` returns zero hits
+   across the entire source tree. TensorFlow is not used anywhere in the codebase.
+
+2. **Inference verified without it:** TASK-001/000 confirmed full end-to-end inference
+   works without TensorFlow installed (it couldn't install on Python 3.12 anyway).
+
+3. **Install savings:** TensorFlow 2.12 pulls ~600MB+ of dependencies including
+   protobuf, grpcio, tensorboard, keras, and numpy version constraints. Removing it
+   reduces install time, disk usage, and eliminates version conflicts.
+
+4. **Python 3.12 incompatibility:** TensorFlow 2.12 does not support Python 3.12.
+   Keeping it in requirements.txt guarantees a failed install on modern Python.
+
+## Quality Gate
+
+N/A — no code change affects inference output. This is a dependency-only removal.
+
+## Risk
+
+None. Zero source references to TensorFlow or TensorBoard.

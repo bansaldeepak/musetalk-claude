@@ -1,0 +1,225 @@
+# Cold Start Optimization — Research & Results
+
+> Measured 2026-09-09 on g6e.xlarge (L40S, ap-south-2).
+> Branch: `perf/s3-avatar-cache`
+
+---
+
+## Problem
+
+Cold start without pre-built avatar cache takes **7+ minutes** (DWPose + VAE encode + geometry
+for 1874 frames). Even with the pre-built cache on S3, the download + Python startup totalled
+**53 seconds** in the initial implementation. The goal is to bring cold start as close to warm
+start (~14s) as possible.
+
+---
+
+## Storage Architecture
+
+```
+Instance: g6e.xlarge (L40S GPU, 32GB RAM, 25 Gbps network)
+EBS root:  gp3 150GB, 125 MB/s throughput (default), 3000 IOPS
+NVMe SSD:  /opt/dlami/nvme — 232.8GB local instance store, ~2+ GB/s sequential
+```
+
+| Storage    | Write speed     | Persists across            | Cost     |
+|------------|-----------------|----------------------------|----------|
+| EBS gp3    | 149 MB/s (dd)   | Everything (durable)       | Included |
+| NVMe local | 312 MB/s (dd direct), burst higher | Container restart ✓, instance stop ✗ | $0 |
+| tmpfs      | Memory speed    | Nothing                    | Uses RAM |
+
+---
+
+## S3 Transfer Benchmarks
+
+Bucket: `s3://taiboli-dev-ml-weights` (ap-south-2, same region as instance).
+Avatar cache: 5.8 GiB (10 files; two 2.7GB `.npy` files dominate).
+
+### Download methods compared
+
+| # | Method | Target | Time | Throughput | Notes |
+|---|--------|--------|------|------------|-------|
+| 1 | `aws s3 cp \| tar` → EBS | EBS | **26s** | 223 MB/s | Original implementation. Pipe = single stream |
+| 2 | `aws s3 cp \| tar` → NVMe | NVMe | **28s** | 207 MB/s | Disk not the bottleneck — same single stream |
+| 3 | `aws s3 cp` (file) → NVMe | NVMe | **27s dl + 22s extract** | 215 MB/s | Multi-part download, but tar sequential |
+| 4 | `s5cmd cp` (tar, single file) → NVMe | NVMe | **13s** | 446 MB/s | s5cmd 2x faster than aws cli on single file |
+| 5 | `aws s3 sync` (individual files, 64 threads) → NVMe | NVMe | **26s** | 223 MB/s | 64-thread config didn't help — still single-connection per file |
+| 6 | `aws s3 cp` × 10 parallel processes → NVMe | NVMe | **20s** | 290 MB/s | Better — 10 concurrent HTTP streams |
+| 7 | **`s5cmd sync` (individual files, 64 workers) → NVMe** | **NVMe** | **7.1s** | **830 MB/s** | **Winner. 6.6 Gbps. Confirmed across 2 runs** |
+
+### Key findings
+
+- **EBS write throughput (125 MB/s) is NOT the bottleneck.** NVMe showed identical times for
+  pipe-based approaches. The pipe forces a single HTTP stream regardless of disk speed.
+- **`aws s3 cp` to stdout (pipe) cannot parallelize.** The 64-thread concurrency setting only
+  applies to multi-part transfers of a single file to disk, not to pipe output.
+- **s5cmd is dramatically faster** — it uses Go's concurrency to saturate multiple HTTP/2 streams.
+  On a single 5.8GB tar file: 13s (vs 27s aws cli). On individual files: 7s.
+- **Individual files enable true parallelism.** The two 2.7GB `.npy` files download simultaneously
+  rather than sequentially inside a tar stream.
+- **VPC endpoint not yet configured.** Traffic currently routes through NAT/public path. A Gateway
+  VPC Endpoint would use the AWS backbone and may improve further.
+
+### Network ceiling test
+
+4 parallel `curl` range-GETs of one 2.7GB file to `/dev/null`: **7.3s at 397 MB/s per file**.
+The g6e.xlarge can sustain at least ~1.6 Gbps per stream and ~6.6 Gbps aggregate with s5cmd.
+Theoretical max is 25 Gbps; we're at ~26% utilization — room for more with VPC endpoint.
+
+---
+
+## Python Startup Breakdown
+
+Measured inside the container. The gap between S3 download completing and "Server started" is
+the Python startup phase.
+
+### Cold page cache (model files not in RAM)
+
+| Phase | Time | Bottleneck |
+|---|---|---|
+| Top-level imports (torch, aiortc, numpy, etc.) | ~4s | EBS reading .so/.pyc files |
+| `_import_musetalk()` (transformers, mmcv, DWPose) | ~4s | EBS reading packages + GPU side-effects |
+| `load_all_model()` — **unet.pth is 3.2GB** | ~17s | **EBS at 125 MB/s = 25s to read 3.2GB** |
+| Avatar cache load (runtime geometry) | 0.5s | NVMe/mmap — already fast |
+| GPU warmup (batch 1-4 inference) | 3s | GPU compute |
+| **Total** | **~29s** | |
+
+### Warm page cache (model files already in RAM)
+
+| Phase | Time | Bottleneck |
+|---|---|---|
+| Top-level imports | 1.9s | All in page cache |
+| `_import_musetalk()` | 1.1s | All in page cache |
+| `load_all_model()` | 6.7s | Deserialization + GPU transfer |
+| Avatar cache load | 0.5s | Same |
+| GPU warmup | 3s | Same |
+| **Total** | **~14s** | |
+
+### The entrypoint pre-warming race
+
+The entrypoint runs `cat model_files > /dev/null &` in the background to warm page cache while
+Python imports. Python imports take ~2s (warm) to ~8s (cold), then hits `load_all_model()`.
+The 3.2GB unet.pth takes ~25s to read from EBS at 125 MB/s — the background `cat` cannot
+finish before Python needs the file. **Pre-warming loses the race on cold cache.**
+
+---
+
+## Three Options to Cut Python Startup
+
+### Option 1: Move model weights to NVMe (RECOMMENDED)
+
+**What:** Mount NVMe as the models directory. Download weights from S3 → NVMe at boot, same
+as avatar cache. Loading 3.2GB unet.pth from NVMe at 2+ GB/s ≈ 1.5s instead of 25s from EBS.
+
+**Impact:** Cold page cache load_all_model drops from ~17s to ~3s. Total cold start:
+  - S3 avatar cache: 7s (already implemented)
+  - S3 model weights: ~4s (6.4GB at 830 MB/s, parallel with avatar cache)
+  - Python startup: ~14s (equivalent to warm-cache timing)
+  - **Projected total: ~21s** (vs current ~53s cold, ~29s warm-EBS-cold-cache)
+
+**Pros:** Largest single improvement. NVMe persists across container restarts (no re-download
+on warm start). Eliminates EBS throughput as a variable entirely.
+
+**Cons:** NVMe is ephemeral — instance stop/start requires re-download (~4s). Need to add
+NVMe volume mount to start-musetalk.sh.
+
+**Implementation:**
+1. Upload model weights to `s3://taiboli-dev-ml-weights/models/`
+2. Entrypoint: if models not on NVMe, `s5cmd sync` from S3
+3. start-musetalk.sh: `-v /opt/dlami/nvme/models:/app/models`
+
+### Option 2: Start S3 downloads in parallel with Python imports
+
+**What:** Currently the entrypoint runs S3 download serially, then starts Python. Instead,
+start both in parallel — Python imports don't need model files for the first ~8s.
+
+**Impact:** Overlaps 7s S3 download with 8s of Python imports. Net savings: ~7s.
+
+**Pros:** No infrastructure changes. Pure entrypoint logic.
+
+**Cons:** Smaller win than Option 1. Complex to orchestrate (Python needs a signal that
+downloads finished). Doesn't help with the 17s load_all_model on cold EBS cache.
+
+**Implementation:**
+1. Entrypoint starts S3 downloads in background
+2. Entrypoint starts Python immediately (not `exec` — need to wait for downloads)
+3. Python checks for a sentinel file or waits for download completion before model load
+
+### Option 3: Convert unet.pth to safetensors
+
+**What:** safetensors format uses memory-mapped loading instead of pickle deserialization.
+Eliminates the CPU-side unpickling cost of torch.load() for the 3.2GB unet.
+
+**Impact:** On warm page cache, load_all_model drops from 6.7s to ~3-4s (the difference is
+deserialization overhead, not I/O). On cold cache, still EBS-bound.
+
+**Pros:** No infrastructure changes. Improves warm start too.
+
+**Cons:** Smallest win of the three. Requires modifying the model loading code. Only helps
+the deserialization phase, not the I/O phase which dominates on cold cache.
+
+**Implementation:**
+1. Convert unet.pth → unet.safetensors (one-time script)
+2. Modify load_all_model to use safetensors.torch.load_file
+3. Update docker image / S3 weights
+
+### Combined approach (maximum impact)
+
+All three options are complementary:
+- Option 1 (NVMe) eliminates EBS I/O bottleneck
+- Option 2 (parallel) overlaps download with imports
+- Option 3 (safetensors) reduces deserialization CPU cost
+
+With all three: projected cold start could reach **~14-16s** — matching warm start.
+
+---
+
+## Current State (after this branch)
+
+| Scenario | Before | After this branch | With Option 1 (projected) |
+|---|---|---|---|
+| True cold start (no cache) | 7+ min | 7+ min (unchanged) | 7+ min |
+| Cold start with S3 cache | N/A | **53s** (26s dl + 27s startup) | **~21s** |
+| Cold start with s5cmd + NVMe | N/A | **34s** (7s dl + 27s startup) | **~21s** |
+| Warm start (all cached) | 14s | 14s | 14s |
+
+---
+
+## S3 Data Layout
+
+```
+s3://taiboli-dev-ml-weights/
+├── avatar-cache/
+│   └── avator_1.tar              # 5.8 GiB — legacy tar format (original approach)
+├── avatar-cache-v2/
+│   └── avator_1/                 # Individual files for parallel download
+│       ├── avatar_info.json
+│       ├── coords.pkl
+│       ├── latents.pt            # 15 MB
+│       ├── mask_coords.pkl
+│       └── runtime/
+│           ├── alpha.npy         # 93 MB
+│           ├── base_part.npy     # 279 MB
+│           ├── idle_frames.npy   # 2.7 GB
+│           ├── idle_prompt.npy   # 75 KB
+│           ├── meta.json         # 281 KB
+│           └── rgb_frames.npy    # 2.7 GB
+└── models/                       # TBD (Option 1)
+```
+
+---
+
+## Infrastructure Changes Required
+
+### Already done (in code, this branch)
+- [x] `docker-entrypoint.sh`: S3 avatar cache download with s5cmd/aws fallback
+- [x] `Dockerfile`: s5cmd binary installed
+- [x] `main_server.py`: `_cache_exists()` relaxed for runtime-only cache
+- [x] S3: avatar cache uploaded as individual files to `avatar-cache-v2/`
+
+### Needs ops changes (outside repo)
+- [ ] `start-musetalk.sh`: add `-v /opt/dlami/nvme/avatar-cache:/app/results/v15/avatars`
+- [ ] SSM: add `AWS_REGION=ap-south-2`
+- [ ] VPC: create S3 Gateway VPC Endpoint (step 4, after testing)
+- [ ] (Option 1) `start-musetalk.sh`: add `-v /opt/dlami/nvme/models:/app/models`
+- [ ] (Option 1) S3: upload model weights to `s3://taiboli-dev-ml-weights/models/`

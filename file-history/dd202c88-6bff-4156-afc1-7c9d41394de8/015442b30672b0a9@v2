@@ -1,0 +1,20 @@
+---
+name: reference-upstream-remote
+description: "Panya-Labs/MuseTalk is the upstream repo for bansaldeepak/Realtime-Avatar (not a GitHub fork, direct clone)"
+metadata: 
+  node_type: memory
+  type: reference
+  originSessionId: dd202c88-6bff-4156-afc1-7c9d41394de8
+  modified: 2026-09-02T04:20:49.365Z
+---
+
+`bansaldeepak/Realtime-Avatar` is a direct clone (not a GitHub fork) of `Panya-Labs/MuseTalk`.
+Git remote `upstream` configured pointing to `https://github.com/Panya-Labs/MuseTalk.git`.
+
+To push branches and create PRs on the original repo:
+```bash
+git push upstream <branch-name>
+gh pr create --repo Panya-Labs/MuseTalk --base main --head <branch-name>
+```
+
+Private repo — fork setting was off on GitHub, so standard fork workflow unavailable.

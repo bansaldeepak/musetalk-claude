@@ -1,0 +1,1124 @@
+# Startup Performance
+
+Tracks avatar server startup time. Goal: warm <10s, cold <1min.
+
+Hardware: g6e.xlarge (4 vCPU, 1x NVIDIA L40S 48GB), CUDA 12.8, Ubuntu 22.04 container.
+Storage: EBS gp3 (default: 3,000 IOPS / 125 MB/s throughput).
+
+---
+
+## Current Baseline (2026-08-12)
+
+### Warm start (avatar cache exists) — 27s total
+
+| Phase | Duration | Cumulative | Notes |
+|-------|----------|------------|-------|
+| Python + imports | ~12s | 12s | TensorFlow (unused) loaded transitively by `transformers` |
+| Load UNet + VAE + Whisper | ~8s | 20s | `torch.load()` from EBS, then `.to(cuda)` |
+| Load avatar from cache | <1s | 21s | Memory-mapped 1874 frames |
+| Reuse runtime geometry | <1s | 21s | Already cached, memory-mapped |
+| Reuse idle cache | <1s | 21s | Already cached, memory-mapped |
+| Warmup (synthetic speech) | ~3.4s | 25s | Batch sizes 1..4 x3, 30 frames |
+| Song catalog + server bind | ~2s | 27s | API fetch + aiohttp start |
+
+### Cold start (no avatar cache) — ~7min 15s total
+
+Documented separately — see "Cold Start Plan" section below.
+
+---
+
+## Key Observation
+
+Docker restart WITHOUT GPU instance restart still takes 8s for model load.
+This confirms: the bottleneck is **EBS read throughput**, not GPU init.
+The Linux page cache is cold after container restart (new PID namespace),
+so the kernel re-reads model files from EBS even if the instance stayed up.
+
+---
+
+## Warm Start: Infra Optimizations (do these first)
+
+### 1. Remove TensorFlow — saves ~8-10s (FREE)
+
+**What:** TensorFlow is in `requirements.txt` but never imported by project code.
+It's loaded transitively when `transformers` probes available backends on import.
+The cuDNN/cuFFT/cuBLAS factory registration errors in logs are TF initializing CUDA — wasted work.
+
+**Evidence:** `grep -r "tensorflow" --include="*.py" --exclude-dir=.venv` returns zero hits
+in project source (only a test's mock list). No `import tensorflow` anywhere.
+
+**Fix:** Remove `tensorflow==2.15.0` from requirements.txt. If `transformers` still
+tries to probe it, set `TRANSFORMERS_NO_TF=1` in the Dockerfile ENV.
+
+**Risk:** None. TF is dead weight.
+
+**Expected result:** Import phase drops from ~12s to ~3-4s (torch + whisper + diffusers).
+
+---
+
+### 2. Provision EBS throughput — saves ~4-6s ($5-10/mo)
+
+**What:** The UNet (unet.pth), VAE (diffusion_pytorch_model.safetensors), and Whisper
+model are read from EBS gp3 at the default 125 MB/s ceiling. Combined model size is
+~1.5-2 GB. At 125 MB/s that's 12-16s of sequential read — matches the observed 8s
+(some overlap with deserialization).
+
+**Why restarting Docker still shows 8s:** Container restart = new PID namespace = page
+cache is effectively cold for those files. The kernel must re-read from EBS.
+
+**Options (pick one):**
+
+| Option | Throughput | Monthly cost delta | Model load estimate |
+|--------|-----------|-------------------|-------------------|
+| gp3 default | 125 MB/s | $0 (current) | ~8s |
+| gp3 provisioned | 500 MB/s | ~$5-8/mo | ~3s |
+| gp3 max | 1,000 MB/s | ~$10-15/mo | ~1.5s |
+| io2 Block Express | 4,000 MB/s | ~$40-60/mo | <1s (overkill) |
+
+**Recommendation:** Provision gp3 to 500 MB/s. Best cost/benefit ratio.
+
+**How:** AWS Console → EBS Volume → Modify → set Throughput to 500.
+Or via CLI:
+```bash
+aws ec2 modify-volume --volume-id vol-XXX --throughput 500
+```
+
+---
+
+### 3. Page cache pre-warming — saves ~4-6s (FREE, complementary to #2)
+
+**What:** After instance start (or Docker restart), read model files into the Linux
+page cache BEFORE the Python process starts. Second read is memory-speed (free).
+
+**Why it works:** Docker restart kills the process but the HOST page cache survives
+(same kernel). The problem is Docker might use a fresh mount namespace or the
+kernel evicted the pages. Pre-warming forces them back.
+
+**Fix — add to docker-entrypoint.sh before the Python launch:**
+```bash
+# Pre-warm model files into page cache (runs at EBS throughput, ~2-3s at 500 MB/s)
+if [ -d "$MODELS_DIR" ] && ! blank_mode "$@"; then
+  echo "[entrypoint] Pre-warming model files into page cache..."
+  find "$MODELS_DIR" -type f \( -name "*.pth" -o -name "*.bin" -o -name "*.safetensors" \) \
+    -exec cat {} > /dev/null \;
+  echo "[entrypoint] Page cache warm"
+fi
+```
+
+**Reasoning:** This runs in parallel with nothing (it's the first thing). When Python
+later does `torch.load()`, the data is already in RAM — the read syscall returns from
+page cache at memory bandwidth (~10 GB/s) instead of waiting for EBS.
+
+**Combined with #2:** At 500 MB/s provisioned throughput, pre-warming ~1.5 GB takes ~3s.
+The Python process then loads models from page cache in <1s. Net effect: model load
+phase nearly eliminated.
+
+---
+
+### 4. Instance store NVMe — NOT recommended for this use case
+
+**What:** g6e.xlarge has 1x 250 GB NVMe instance store.
+
+**Why not:**
+- Instance store is **wiped on every stop/start** (ephemeral)
+- On each boot you'd need to copy models from EBS → NVMe (still limited by EBS read)
+- Only benefits if you read the same file multiple times per boot (we don't)
+- Adds complexity to entrypoint with no net gain over page-cache pre-warming
+
+**When it WOULD help:** If models were >10 GB and you needed random-access reads
+during runtime. Our models are ~1.5 GB sequential reads — page cache handles this.
+
+---
+
+### 5. Docker layer caching / bind mount the models volume
+
+**What:** If models are on a separate EBS volume mounted directly to the host
+(not inside the Docker image layer), ensure the Docker mount is `--volume` not
+`tmpfs` — the host page cache is shared with the container.
+
+**Check:** If using ECS with EBS volumes attached via task definition, ensure the
+mount type preserves page cache across container restarts on the same host.
+
+---
+
+### 6. S3 → tmpfs (RAM disk) for model loading — ALTERNATE APPROACH (needs validation)
+
+**Insight:** S3 same-region to EC2 delivers ~1000 MB/s (25 Gbps network) with **zero
+data transfer cost**. EBS gp3 is capped at 125 MB/s. Instead of paying to make EBS
+faster, bypass EBS entirely: download models from S3 into a RAM-backed filesystem,
+then torch.load() reads at memory speed.
+
+**How it works:**
+```bash
+# In docker-entrypoint.sh — download models from S3 to RAM, not EBS
+S3_MODELS_FAST="${S3_MODELS_FAST:-}"
+FAST_MODELS_DIR="/dev/shm/models"  # tmpfs (RAM-backed, already exists in Linux)
+
+if [ -n "$S3_MODELS_FAST" ]; then
+  echo "[entrypoint] Downloading models from S3 to RAM..."
+  mkdir -p "$FAST_MODELS_DIR"
+  aws s3 sync "$S3_MODELS_FAST" "$FAST_MODELS_DIR" --quiet
+  echo "[entrypoint] Models in RAM (~2s)"
+  export MODELS_DIR="$FAST_MODELS_DIR"
+fi
+```
+
+**Why this works:**
+- g6e.xlarge has 32 GB RAM — dedicating 2-3 GB to tmpfs is trivial
+- S3 in-region data transfer to EC2: **$0/GB** (free)
+- S3 storage for 2 GB: **$0.05/mo**
+- Download 2 GB at ~1000 MB/s: **~2s**
+- Then torch.load() from tmpfs: reads from RAM at ~10 GB/s = **<1s**
+- Total model load: **~3s** (vs 8s from EBS, vs 3s with $5-10/mo EBS provisioning)
+
+**Comparison: EBS provisioning vs S3→tmpfs**
+
+| Aspect | EBS provisioned (500 MB/s) | S3 → tmpfs |
+|--------|---------------------------|------------|
+| Model load time | ~3s | ~3s (2s download + <1s read) |
+| Monthly cost | $5-10/mo | ~$0.05/mo |
+| Works after instance stop/start | Yes (data persists on EBS) | Yes (re-downloads from S3, ~2s) |
+| Works after Docker restart | Needs page cache warm (~3s first read) | Re-downloads (~2s), always consistent |
+| Fallback if source unavailable | Always available (local disk) | Falls back to EBS models |
+| RAM usage | None extra | ~2-3 GB of RAM |
+| Network dependency at startup | None | Needs S3 access (~2s) |
+| Complexity | AWS console change | Entrypoint code change |
+
+**Verdict:** S3→tmpfs is cheaper and equally fast. The only downside is a network
+dependency at startup (if S3 is unreachable, fall back to EBS). Since the instance
+already needs network for Azure OpenAI and the Taiboli API, this is not a new dependency.
+
+**Can extend to avatar cache too:** Same approach for the avatar runtime cache on cold start.
+Download entire working set from S3 to tmpfs = models + avatar cache all in RAM.
+
+**RAM budget (g6e.xlarge = 32 GB):**
+- Models: ~2 GB
+- Avatar runtime cache (rgb_frames + idle_frames + latents): ~5.5 GB
+- Total in tmpfs: ~7.5 GB
+- Remaining for OS + Python process: ~24.5 GB (plenty)
+
+---
+
+## Comparison: All Warm Start Approaches
+
+| # | Approach | Load time | Monthly cost | Effort | Risk | Notes |
+|---|----------|-----------|-------------|--------|------|-------|
+| 1 | Remove TensorFlow | Import: 12s→3s | $0 | Trivial | None | Dead dependency |
+| 2 | EBS provision 500 MB/s | Model: 8s→3s | $5-10 | AWS console | None | Proven, simple |
+| 3 | Page cache pre-warming | Model: 8s→<1s (2nd read) | $0 | Small code | None | Only helps Docker restart, not instance start |
+| 6 | S3→tmpfs | Model: 8s→3s | ~$0 | Small code | S3 dependency | Cheapest fast option |
+| 7 | Safetensors format | Model: deserialize saves ~1-2s | $0 | Small code | Testing needed | Complements any I/O approach |
+| L1 | S3 avatar cache (cold→warm) | Cold: 7min→12s | ~$0.15/mo | Medium code | S3 dependency | Eliminates cold start entirely |
+
+---
+
+## Projected Warm Start After Infra Fixes
+
+| Phase | Current | After fixes | How |
+|-------|---------|-------------|-----|
+| Python + imports | 12s | **3-4s** | Remove TensorFlow (#1) |
+| Load models from disk | 8s | **<1s** | Pre-warm (#3) + provision EBS (#2) |
+| Load avatar cache | <1s | <1s | Already fast |
+| Warmup (synthetic speech) | 3.4s | 3.4s | Needed for CUDA kernels |
+| Song catalog + bind | 2s | 2s | Network-bound |
+| **Total** | **27s** | **~9-10s** | |
+
+To go below 8s after infra: code-level changes (lazy imports, reduce warmup passes).
+
+---
+
+## Warm Start: Code Optimizations (after infra is exhausted)
+
+These are the NEXT layer if infra alone doesn't hit <10s.
+
+### 6. Lazy imports for heavy modules
+
+Defer `diffusers`, `transformers`, whisper imports until `MuseTalkEngine.initialize()`
+rather than top-of-file. Saves 1-2s if they pull in heavy sub-dependencies.
+
+### 7. Convert .pth → safetensors format
+
+`torch.load()` uses pickle (slow, security risk). Safetensors uses mmap + zero-copy:
+```python
+# Current (pickle, full file read + deserialize):
+weights = torch.load(model_path)
+
+# Safetensors (mmap, near-instant if page cache is warm):
+from safetensors.torch import load_file
+weights = load_file(model_path, device="cuda:0")
+```
+One-time conversion: `torch.save` → `safetensors.torch.save_file`. Saves ~1-2s
+on deserialization overhead even with warm page cache.
+
+### 8. Reduce warmup passes
+
+Currently: batch sizes 1..4 x3 = 12 forward passes, 30 frames.
+Could reduce to batch size 4 x1 = 1 forward pass if CUDA kernel compilation
+is the only goal (cuDNN autotuner needs one pass per unique shape).
+
+### 9. Parallel model loading
+
+Load UNet, VAE, and Whisper concurrently (separate threads for disk I/O,
+serialize only the `.to(device)` step). Saves ~1-2s if loads don't overlap.
+
+---
+
+## Cold Start Analysis (2026-08-13)
+
+Cold start = no avatar cache exists. Must process raw video into render-ready cache.
+Target: **~7min 15s → <1min**.
+
+### Current cold start breakdown — ~435s total
+
+| # | Phase | Duration | % | Bottleneck | What it does |
+|---|-------|----------|---|-----------|--------------|
+| 1 | Python + imports | ~19s | 4% | CPU | TF init (unused), torch, transformers |
+| 2 | Load UNet + VAE + Whisper | ~7s | 2% | I/O (EBS) | torch.load from disk → GPU |
+| 3 | Video → PNG frames | ~17s | 4% | I/O + CPU | cv2.VideoCapture → cv2.imwrite 937 PNGs |
+| 4 | DWPose + face detection | ~76s | 17% | GPU + CPU | Per-frame inference, batch_size=1 |
+| 5 | Encode avatar latents | ~12s | 3% | GPU | VAE encode each 256×256 face crop |
+| 6 | **Prepare blend masks** | **~171s** | **39%** | **GPU + CPU** | FaceParsing BiSeNet per frame (1874 frames) |
+| 7 | Write + reload cache | ~39s | 9% | I/O (EBS) | Write PNGs + pickle + torch.save, then re-read |
+| 8 | Runtime geometry | ~13s | 3% | CPU | Build blend params, resize frames, compute alphas |
+| 9 | Precompute idle frames | ~29.5s | 7% | GPU | UNet forward pass for every frame with closed-mouth prompt |
+| 10 | Write idle cache | ~8s | 2% | I/O | np.save idle frames + runtime tensors |
+| 11 | Warmup | ~3s | 1% | GPU | CUDA kernel compilation (cuDNN autotuner) |
+
+---
+
+### Deep dive: why each phase is slow
+
+#### Phase 3: Video → PNG frames (17s)
+
+```python
+# Current: decode video frame-by-frame, write each as PNG to disk
+while True:
+    ok, frame = cap.read()
+    cv2.imwrite(f"{count:08d}.png", frame)  # PNG encode + EBS write per frame
+```
+
+**Why slow:** 937 PNG encodes (CPU-bound, ~15ms each) + 937 disk writes.
+The frames are immediately re-read in the next phase — round-trip through disk is pure waste.
+
+**Fix:** Keep frames in memory. Never write PNGs. The only reason they're written is to
+create the cache directory — but the cache format could be a single .npy file instead.
+
+---
+
+#### Phase 4: DWPose + face detection (76s)
+
+```python
+batch_size_fa = 1  # hardcoded to 1!
+for fb in batches:
+    results = inference_topdown(model, np.asarray(fb)[0])  # mmpose, one frame at a time
+    bbox = fa.get_detections_for_batch(np.asarray(fb))     # face_alignment, one frame
+```
+
+**Why slow:** Processes 937 frames one at a time. GPU kernel launch overhead dominates at
+batch=1. The mmpose model (DWPose) and face_alignment (s3fd) each do a full forward pass
+per frame with no batching.
+
+**Measured:** 937 frames / 76s = 12.3 it/s. At batch 1, most of the 8ms per iteration is
+kernel launch + CPU overhead, not actual compute.
+
+**Fix:** Batch the DWPose inference. The mmpose API supports batched input. Even batch-8
+would cut this from 76s to ~15-20s. Face detection (s3fd) also supports batching.
+
+---
+
+#### Phase 5: Encode avatar latents (12s)
+
+```python
+for bbox, frame in zip(coord_list, frame_list):
+    crop_frame = frame[y1:y2, x1:x2]
+    resized_crop = cv2.resize(crop_frame, (256, 256))
+    latent = self.vae.get_latents_for_unet(resized_crop)  # one frame at a time
+```
+
+**Why slow:** 937 individual VAE encode calls. Each is a GPU kernel launch for a tiny input.
+
+**Fix:** Batch VAE encoding (stack multiple 256×256 crops → single forward pass).
+The VAE encoder handles arbitrary batch sizes. Batch-16 would cut from 12s to ~3s.
+
+---
+
+#### Phase 6: Prepare blend masks (171s) — THE BOTTLENECK
+
+```python
+for i, frame in enumerate(frame_cycle):  # 1874 frames (forward + reverse)
+    cv2.imwrite(frame_path, frame)        # write PNG to disk (WHY?)
+    mask, crop_box = get_image_prepare_material(frame, coord, fp=self.face_parser)
+    cv2.imwrite(mask_path, mask)          # write mask PNG to disk
+```
+
+Each `get_image_prepare_material` call does:
+1. Crop face region from frame (CPU, fast)
+2. **`face_seg()` → BiSeNet forward pass on GPU** (the actual face parsing model)
+3. Mask manipulation: crop, paste, boundary ratio (CPU, fast)
+4. `cv2.GaussianBlur` on mask (CPU, ~1ms)
+
+**Why slow (171s / 1874 frames = 91ms per frame):**
+- BiSeNet inference is done **one frame at a time** (batch=1) — same kernel-launch waste as Phase 4
+- Each frame is written to disk as PNG — 1874 PNG encodes + writes (pure waste)
+- The PIL Image conversions (BGR→RGB→PIL→tensor→GPU→CPU→numpy→PIL→numpy) happen per frame
+- The face_parser receives a PIL Image, converts to tensor, unsqueezes to batch-1, runs model
+
+**The fix potential is enormous:**
+- BiSeNet supports batch inference (it's a standard segmentation network)
+- Batch-16 would cut GPU portion from ~50ms/frame to ~5ms/frame
+- Eliminating disk writes saves 1874 × ~10ms = ~19s
+- Eliminating PIL↔numpy↔tensor conversions per-frame saves another ~10s
+
+**Estimated with batch-16 + no disk I/O:** 1874 frames × ~10ms = ~19s (down from 171s, **9x speedup**)
+
+---
+
+#### Phase 7: Write + reload cache (39s)
+
+Currently writes:
+- 1874 full-frame PNGs (large: 1080p each)
+- 1874 mask PNGs
+- coords.pkl, mask_coords.pkl, latents.pt
+- Then immediately re-reads them all in `_load_cache()`
+
+**Why slow:** PNG encoding 1874 frames at source resolution is ~20s of CPU work.
+Then re-reading them is another ~19s (PNG decode from EBS).
+
+**Fix:**
+- Don't write/read PNGs at all during cold start — keep frames in memory
+- Write the final runtime cache directly (single .npy files, not individual PNGs)
+- The .npy format is uncompressed and memory-mappable — write once, mmap on next boot
+- Eliminates the entire "write then re-read" round-trip
+
+---
+
+#### Phase 9: Precompute idle frames (29.5s)
+
+```python
+for offset in range(0, n, batch_size):  # n=1874, batch_size=4
+    rendered.extend(self.render_batch([unet_prompt] * len(indices), indices))
+```
+
+**Why slow:** 1874 frames / batch 4 = 469 batches × 16.6ms = ~7.8s GPU time.
+The remaining ~22s is CPU blending + numpy operations between batches.
+
+**Fix options:**
+1. Run after server starts listening (serve requests while idle cycle builds in background)
+2. Increase batch size for idle precompute (batch-8 or higher — no latency constraint here)
+3. Compute lazily on first idle display (cache fills up over first few seconds)
+
+---
+
+### Cold Start: Infra Optimizations
+
+#### I1. Remove TensorFlow — saves ~8-10s
+
+Same as warm start fix #1. Import drops from 19s to ~9-10s.
+
+#### I2. Provision EBS throughput — saves ~5-8s
+
+Affects Phase 2 (model load) and Phase 7 (cache writes). At 500 MB/s:
+- Model load: 8s → 3s
+- Cache write throughput: faster PNG writes (though eliminating PNGs is better)
+
+#### I3. Pre-warm model files — saves ~3-5s
+
+Same as warm start fix #3. Overlaps with I2.
+
+---
+
+### Cold Start: Code Optimizations (the big wins)
+
+#### C1. Eliminate disk round-trips — saves ~50-60s
+
+The current pipeline writes 3748 PNG files then reads them back. This is legacy from
+the original MuseTalk codebase which was designed for offline batch processing.
+
+**Changes:**
+- `_video_to_imgs`: decode video frames → keep in memory (never write PNGs)
+- `prepare()` blend mask loop: don't `cv2.imwrite` each frame/mask
+- `_load_cache()` after prepare: skip entirely (data already in memory)
+- Write final cache as .npy + pickle directly (single sequential writes)
+
+**Estimated save:** Phase 3 (17s → 2s), Phase 6 disk portion (~19s), Phase 7 (39s → 5s)
+= **~55-60s saved**
+
+#### C2. Batch DWPose inference — saves ~55-60s
+
+```python
+# Current: batch_size_fa = 1
+# Fix: batch_size_fa = 8 or 16
+batches = [frames[i:i + batch_size] for i in range(0, len(frames), batch_size)]
+```
+
+mmpose's `inference_topdown` processes one image but the underlying model handles batches.
+Replace with batch inference using the mmpose batch API or direct model forward pass.
+
+**Estimated:** 937 frames at batch-8: ~76s → ~15s (**5x speedup**)
+
+#### C3. Batch BiSeNet (face parsing) — saves ~130-140s
+
+The single biggest win. Currently runs 1874 individual GPU forward passes.
+
+```python
+# Current: one frame at a time through PIL → tensor → GPU → CPU
+mask_image = face_seg(face_large, mode=mode, fp=fp)
+
+# Fix: batch N crops, run BiSeNet once, post-process in parallel
+crops_batch = torch.stack([preprocess(crop) for crop in crops[:batch_size]])
+out_batch = self.net(crops_batch.cuda())[0]  # single kernel launch
+```
+
+**Estimated:** 1874 frames at batch-16: ~171s → ~15-20s (**9-10x speedup**)
+
+#### C4. Batch VAE encoding — saves ~8-9s
+
+```python
+# Current: one crop at a time
+latent = self.vae.get_latents_for_unet(resized_crop)
+
+# Fix: stack crops, encode in batches
+batch_crops = torch.stack(crops[offset:offset+16])
+batch_latents = self.vae.encode_batch(batch_crops)
+```
+
+**Estimated:** 937 frames at batch-16: ~12s → ~3s
+
+#### C5. Defer idle cycle to background — saves ~29.5s (perceived)
+
+Start the server BEFORE precomputing idle frames. Serve a static frame for the first
+~30s while idle cycle builds in a background thread. The server is usable immediately.
+
+```python
+# Start server
+await site.start()
+logger.info("Server started")
+
+# Build idle cycle in background (non-blocking)
+asyncio.get_running_loop().run_in_executor(None, self.engine.build_idle_cycle)
+```
+
+**Trade-off:** First 30s of idle shows a static frame (slight quality regression)
+instead of the smooth precomputed cycle. Acceptable for faster startup.
+
+#### C6. Parallel pipeline (advanced)
+
+Phases 4, 5, and 6 all process the same frame sequence and could overlap:
+- Frame N enters DWPose while Frame N-8 enters BiSeNet while Frame N-16 enters VAE
+
+A producer-consumer pipeline with GPU work on one stream and CPU post-processing
+on another thread. Complex but could shrink phases 4+5+6 from 259s to ~40-50s
+by overlapping GPU idle time.
+
+---
+
+### Projected Cold Start After All Fixes
+
+| Phase | Current | After | How |
+|-------|---------|-------|-----|
+| Python + imports | 19s | **9s** | Remove TF (I1) |
+| Load models | 7s | **2s** | EBS provision + pre-warm (I2, I3) |
+| Video decode (in-memory) | 17s | **2s** | No PNG writes (C1) |
+| DWPose + face detection | 76s | **15s** | Batch-8 inference (C2) |
+| VAE encoding | 12s | **3s** | Batch-16 (C4) |
+| Blend masks (BiSeNet) | 171s | **18s** | Batch-16 + no disk I/O (C3, C1) |
+| Write cache | 39s | **5s** | Direct .npy, no PNGs (C1) |
+| Runtime geometry | 13s | **8s** | Mostly CPU-bound, minor gains |
+| Idle frames | 29.5s | **0s** | Background after server start (C5) |
+| Warmup | 3s | **3s** | Still needed |
+| **Total** | **~435s** | **~65s** | |
+
+With the pipeline approach (C6) overlapping GPU phases: potentially **~45-50s**.
+
+---
+
+### Implementation Priority (cold start)
+
+| Priority | Fix | Effort | Saves | Cumulative |
+|----------|-----|--------|-------|-----------|
+| 1 | I1: Remove TensorFlow | Trivial | 10s | 425s |
+| 2 | C1: Eliminate disk round-trips | Medium | 55s | 370s |
+| 3 | C3: Batch BiSeNet | Medium | 140s | 230s |
+| 4 | C2: Batch DWPose | Medium | 60s | 170s |
+| 5 | C5: Defer idle to background | Easy | 30s | 140s |
+| 6 | I2: Provision EBS | Infra only | 5s | 135s |
+| 7 | C4: Batch VAE | Easy | 9s | 126s |
+| 8 | C6: Pipeline overlap | Hard | 40s | ~85s |
+
+Fixes 1-5 get us from **435s → ~140s** (~2.3 min). Adding batched GPU work (3+4) is the
+key to breaking under 1 minute — they alone save 200s.
+
+---
+
+### Key Insight: Cold Start is a Batching Problem
+
+The original MuseTalk code was designed for offline processing where latency doesn't
+matter. Every GPU model (DWPose, BiSeNet, VAE) is called with batch_size=1, paying
+full kernel-launch overhead per frame. The video is decoded to individual PNG files
+on disk because the original CLI tool expected image directories.
+
+For our server use case:
+- We know the full frame count upfront (937 frames from a fixed video)
+- We can hold all frames in memory (they're ~4.5 GB, and we have 64+ GB RAM)
+- GPU models are already loaded — we just need to feed them data efficiently
+- The cache only needs to be written once (not in a human-editable format)
+
+The path from 7 min → <1 min is primarily: **batch everything, skip disk I/O**.
+
+---
+
+## Beyond Code: GPU Snapshots & CUDA Checkpoint (2026-08-13)
+
+After exhausting batching + I/O optimizations, the next frontier is **eliminating the
+load-from-disk step entirely**. The key insight: our models never change between
+restarts. Why deserialize them from EBS → CPU RAM → GPU every time?
+
+### The Vision
+
+```
+Traditional:        Stop → Start → Import Python → Load models → Warmup → Ready (27s+)
+With GPU snapshot:  Stop → Start → Restore snapshot → Ready (~2-5s)
+```
+
+Snapshot the entire process state (Python interpreter + loaded models in VRAM) after
+initialization. On next start, restore the snapshot instead of replaying initialization.
+
+### Available Technologies
+
+#### 1. NVIDIA cuda-checkpoint (github.com/NVIDIA/cuda-checkpoint)
+
+| Aspect | Detail |
+|--------|--------|
+| What it snapshots | GPU device memory (VRAM) copied to host RAM. CUDA objects (streams, contexts) released and recreated |
+| CPU state | NOT handled — delegates to CRIU for full process state |
+| Restore time | Not benchmarked publicly, but VRAM restore is memory-bandwidth limited (~5 GB/s) |
+| Requirements | Linux, NVIDIA driver 570+ (basic), **580+ for container passthrough**, 610+ for IPC |
+| Limitations | No UVM memory. No IPC shared memory. All in-flight GPU work must complete before checkpoint. Same GPU chip type required for restore |
+| Container support | Driver 580+ adds container partial passthrough. Works with CRIU |
+| Status | **Active development, not production-complete.** Feature set expanding per driver release |
+
+#### 2. Modal GPU Memory Snapshots (modal.com/blog/gpu-mem-snapshots)
+
+| Aspect | Detail |
+|--------|--------|
+| What it snapshots | Full CPU process (via gVisor) + GPU device memory + CUDA sessions/streams/contexts |
+| Restore time | **2-5s** for workloads that normally take 20-45s cold start |
+| Requirements | NVIDIA driver 570/575+, Modal's custom infrastructure (gVisor, not Docker) |
+| Limitations | Alpha stage. Cross-host requires matching GPU hardware. No multi-GPU. |
+| Container support | **gVisor only — NOT compatible with Docker or ECS** |
+| Status | Alpha — `experimental_options={"enable_gpu_snapshot": True}` |
+
+#### 3. Modal CPU-only Snapshots (modal.com/blog/mem-snapshots)
+
+| Aspect | Detail |
+|--------|--------|
+| What it snapshots | Full container state (process tree, memory, FDs, CPU registers, filesystem) |
+| What it EXCLUDES | GPU state, network connections |
+| Restore time | ~1s for Python imports, ~3.5s for model load to CPU (still needs `.to(cuda)`) |
+| Requirements | gVisor, CPU architecture match, driver version match |
+| Container support | **gVisor only** |
+| Status | Production on Modal with automatic fallback |
+
+#### 4. CUDA Driver API (low-level building block)
+
+```
+cuCheckpointProcessLock → cuCheckpointProcessCheckpoint → [store VRAM to disk/RAM]
+cuCheckpointProcessRestore → cuCheckpointProcessUnlock → [process resumes]
+```
+
+State machine: RUNNING → LOCKED → CHECKPOINTED → LOCKED → RUNNING.
+Designed to pair with a CPU-side tool (CRIU). Same chip type required.
+
+---
+
+### Where to Store the Snapshot? S3 Beats EBS.
+
+The concern: "if we stop the GPU, the snapshot is on EBS, so we hit the same
+EBS throughput bottleneck on restore." **Correct — but S3 solves this.**
+
+| Storage | Throughput to g6e instance | 6 GB restore time |
+|---------|---------------------------|-------------------|
+| EBS gp3 (default) | 125 MB/s | 48s (worse than current!) |
+| EBS gp3 (provisioned) | 500 MB/s | 12s |
+| **S3 same-region** | **~1000-1250 MB/s** | **~5-6s** |
+| S3 cross-region replica | ~500-800 MB/s | ~8-10s |
+
+**Why S3 is faster than EBS:** g6e.xlarge has 25 Gbps network. S3 within the same region
+saturates that. No IOPS limits, no throughput ceiling. EBS gp3 is capped at 125 MB/s by
+default — 8-10x slower than S3.
+
+**The pattern already exists:** `S3_WEIGHTS_URI` in docker-entrypoint.sh downloads model
+weights from S3 on first boot. Extending this to the avatar cache is trivial.
+
+---
+
+### Two Levels: Avatar Cache on S3 (today) vs Full GPU Snapshot (future)
+
+#### Level 1: Pre-built Avatar Cache on S3 — WORKS TODAY, no new tech needed
+
+The avatar cache (`results/v15/avatars/avator_1/`) is the output of cold start. It's
+deterministic: same video + same models = same cache. Build it once, reuse everywhere.
+
+**What to store on S3 (runtime cache only, skip source PNGs):**
+- `runtime/rgb_frames.npy` — ~2.7 GB (composited base frames, memory-mappable)
+- `runtime/idle_frames.npy` — ~2.7 GB (precomputed idle cycle)
+- `latents.pt` — ~0.06 GB (per-frame VAE latents)
+- `coords.pkl`, `mask_coords.pkl`, `geometry.pkl` — small metadata
+- **Total: ~5.5 GB**
+
+**Cold start with S3 cache:**
+```
+Instance starts → download 5.5 GB from S3 (~5s) → load models (~3s after fixes)
+→ warm start path (cache exists) → server ready in ~10-12s
+```
+
+**vs current cold start: 7 minutes 15 seconds → ~10-12s. That's 35x faster.**
+
+**Implementation (extend existing entrypoint pattern):**
+```bash
+S3_AVATAR_CACHE_URI="${S3_AVATAR_CACHE_URI:-}"
+AVATAR_CACHE_DIR="./results/v15/avatars/avator_1"
+
+if [ -d "$AVATAR_CACHE_DIR/runtime" ]; then
+  echo "[entrypoint] Avatar cache found locally"
+elif [ -n "$S3_AVATAR_CACHE_URI" ]; then
+  echo "[entrypoint] Downloading avatar cache from S3..."
+  aws s3 sync "$S3_AVATAR_CACHE_URI" "$AVATAR_CACHE_DIR" --quiet
+  echo "[entrypoint] Avatar cache ready"
+fi
+```
+
+**Build pipeline:**
+```bash
+# Run once on a build machine (or CI), upload result:
+docker run --gpus all <image> --prepare_only
+aws s3 sync ./results/v15/avatars/avator_1/runtime s3://bucket/avatar-cache/avator_1/runtime
+aws s3 cp ./results/v15/avatars/avator_1/latents.pt s3://bucket/avatar-cache/avator_1/
+aws s3 cp ./results/v15/avatars/avator_1/coords.pkl s3://bucket/avatar-cache/avator_1/
+aws s3 cp ./results/v15/avatars/avator_1/mask_coords.pkl s3://bucket/avatar-cache/avator_1/
+```
+
+#### Cache vs Code Deployments — Will New Docker Images Break the S3 Cache?
+
+**NO — server code changes do not invalidate the avatar cache.**
+
+The cache is pure pixel data + geometry from a deterministic pipeline (video → face
+detection → VAE encoding → mask generation → blend computation → idle rendering).
+The server code that USES these cached frames (WebRTC, sessions, API) is decoupled.
+
+**What invalidates the cache (requires rebuild + re-upload to S3):**
+
+| Change | Why | How often |
+|--------|-----|-----------|
+| Different avatar video | All frames change | Rare (new avatar) |
+| `bbox_shift`, `extra_margin` | Face crop coordinates change | Rare (tuning) |
+| `parsing_mode`, `cheek_width` | Masks change | Rare (tuning) |
+| `output_size` (e.g. 720→1080) | All cached frames wrong resolution | Rare |
+| `idle_mode` or `idle_silence_noise` | Idle frames change | Occasional |
+| Bump `RUNTIME_CACHE_VERSION` | Developer explicitly marks cache stale | Only on blend math changes |
+| Bump `IDLE_CACHE_VERSION` | Idle render logic changed | Only on idle algorithm changes |
+| Model weights update (UNet, VAE) | Latents + rendered frames change | Rare |
+
+**What does NOT invalidate the cache (deploy freely):**
+
+| Change | Why it's safe |
+|--------|--------------|
+| WebRTC transport code | Uses cached frames, doesn't produce them |
+| Audio pipeline / mic gate | Completely separate from video cache |
+| Session management / relay protocol | Orchestration layer, not render layer |
+| Azure OpenAI / realtime integration | Brain, not face |
+| API endpoints, CORS, health checks | Server plumbing |
+| Song lyrics, greeting logic | Content, not pixels |
+| Entrypoint / Docker config | Infrastructure |
+
+**Built-in safety:** The code already validates cache via `avatar_info.json` (checked on
+load) and `meta.json` (checked for runtime/idle caches). If a code change bumps
+`RUNTIME_CACHE_VERSION` or `IDLE_CACHE_VERSION`, the server detects the mismatch and
+rebuilds automatically. The S3 cache becomes a fast path; the local rebuild is the
+fallback — never a broken state.
+
+**Practical workflow:**
+1. Most deploys (WebRTC fixes, API changes, session logic): just push new image, S3 cache
+   is still valid, server starts in ~12s.
+2. Rare deploys (change avatar, tweak face params, update model): rebuild cache in CI,
+   re-upload to S3, then push new image. Still ~12s start but with fresh cache.
+
+---
+
+#### Level 2: Full GPU Snapshot on S3 — Future (requires CUDA checkpoint maturity)
+
+Goes further: snapshot the ENTIRE initialized state (Python + models in VRAM + avatar
+loaded + warmup done). On restore, the process resumes mid-execution as if it never stopped.
+
+**What it saves additionally over Level 1:**
+- Eliminates Python import time (~3-4s after TF removal)
+- Eliminates model deserialization (torch.load, .to(cuda))
+- Eliminates warmup (CUDA kernels already compiled)
+- Server ready in **~5-6s** (pure S3 download time)
+
+**Snapshot size:** ~6-10 GB (VRAM state + CPU process memory)
+**S3 download:** ~6-10s at 1000 MB/s
+
+**When to pursue:** After NVIDIA driver 580+ is standard on AWS AMIs and cuda-checkpoint
++ CRIU integration is production-stable. Level 1 gets us 90% of the benefit today.
+
+---
+
+### Viability for our setup (AWS g6e + Docker + ECS)
+
+| Approach | Works on our infra? | Why / why not |
+|----------|-------------------|---------------|
+| Modal GPU snapshots | **No** | Requires gVisor, Modal's orchestrator. Not portable. |
+| Modal CPU snapshots | **No** | Same — gVisor only, not Docker/ECS. |
+| cuda-checkpoint + CRIU in Docker | **Possible but hard** | Need driver 580+, CRIU 4.0+, custom orchestration. Docker's `checkpoint` command exists but is experimental and poorly maintained. ECS has no native support. |
+| DIY: dump VRAM to EBS, restore on start | **Possible** | Use cuda-checkpoint API directly in our Python process. Checkpoint after initialization, save to EBS. On next start, restore from file. Most promising DIY path. |
+
+---
+
+### DIY GPU Snapshot: What it Would Look Like
+
+**Phase 1: After initialization completes (once per avatar change):**
+```python
+# Server is fully initialized — models loaded, avatar prepared, idle cycle built
+# Trigger CUDA checkpoint: dump all VRAM to a file on EBS
+cuda_checkpoint_save("/app/snapshots/musetalk_ready.ckpt")
+# Also CRIU-checkpoint the entire Python process state
+criu_dump(pid=os.getpid(), dest="/app/snapshots/process/")
+```
+
+**Phase 2: On subsequent starts (every restart):**
+```python
+# Instead of running main() → imports → model load → avatar → warmup:
+if snapshot_exists("/app/snapshots/"):
+    criu_restore("/app/snapshots/process/")  # CPU state restored
+    cuda_checkpoint_restore("/app/snapshots/musetalk_ready.ckpt")  # VRAM restored
+    # Process resumes exactly where it was checkpointed — server is ready
+```
+
+**Estimated restore time:** 2-5s (limited by reading snapshot from EBS into VRAM).
+At 500 MB/s provisioned EBS and ~6 GB total state: ~12s worst case, ~5s with page cache warm.
+
+---
+
+### Practical Roadmap
+
+| Phase | What | When | Prereq |
+|-------|------|------|--------|
+| **Now** | Code optimizations (batching, I/O elimination) | Immediate | None |
+| **Next** | Infra optimizations (EBS, TF removal, pre-warming) | This sprint | None |
+| **After** | Evaluate CRIU + cuda-checkpoint on g6e | When driver 580+ is on our AMI | Code opts done |
+| **Future** | Full snapshot restore for sub-5s starts | When CRIU/CUDA checkpoint matures | Prototype validated |
+
+---
+
+### Why Not Switch to Modal?
+
+Modal's GPU snapshots are exactly what we want — but:
+- Our deployment is on AWS ECS (existing infra, compliance, networking, cost controls)
+- Modal is a managed platform — can't self-host, vendor lock-in
+- No WebRTC support in Modal's serverless model (persistent connections required)
+- Cost at scale: Modal charges per-second GPU time; our 2-session-per-GPU model is cheaper
+
+**The right play:** Watch Modal's blog for when NVIDIA open-sources the full checkpoint
+toolchain (it's trending that way — cuda-checkpoint repo is public). When driver 580+
+is standard on AWS AMIs and CRIU integration stabilizes, build our own version.
+
+---
+
+### Alternative: Warm Pool / Keep-Alive Strategy
+
+If GPU snapshots aren't ready, a simpler operational approach:
+
+**Don't stop the GPU at all — keep a warm pool:**
+- Minimum 1 instance always running (cost: $2/hr × 24h = $48/day)
+- Scale up additional instances on demand (pre-warmed from cached avatar)
+- Scale down to 1 (never 0) during low traffic
+
+**Break-even:** If average daily usage is >2 hours, a warm pool is cheaper than
+paying 27s cold start latency (which wastes user time and degrades first experience).
+
+At current $2/hr for g6e.xlarge:
+- Always-on 1 instance: $1,440/mo
+- vs. stop/start with 27s cold penalty each time
+
+This is a business decision: is $1,440/mo worth eliminating cold start entirely?
+With multi-session (2 users per GPU), the effective cost drops to $720/mo per slot.
+
+---
+
+## Improvement Log
+
+| Date | Change | Phase | Before | After | Notes |
+|------|--------|-------|--------|-------|-------|
+| 2026-09-02 | Lazy DWPose/S3FD loading | Import | 18s | 4s | Skip 389MB DWPose + S3FD on warm start |
+| 2026-09-02 | Safetensors UNet | Model load | 34s | 6.7s | mmap + zero-copy vs pickle deserialize |
+| 2026-09-02 | (combined v1) | **Total warm start** | **69s** | **16s** | **4.3x improvement** |
+| 2026-09-02 | Cache base_part_inter | Geometry rebuild | 1.6s | 0.54s | Save blend params as uint8 .npy, skip recompute |
+| 2026-09-02 | Reduce warmup passes | Warmup | 3.5s | 3.2s | 2 iterations instead of 3, 1.5s audio |
+| 2026-09-02 | Background page cache pre-warming | Entrypoint | N/A | overlap | Pre-warm model files during Python imports |
+| 2026-09-02 | Remove TensorFlow from requirements | Pending | 3.8s imports | ~2s est. | Requires Docker rebuild |
+| 2026-09-02 | TRANSFORMERS_NO_TF=1 in Dockerfile | Pending | — | — | Belt-and-suspenders with TF removal |
+| 2026-09-02 | (combined v2) | **Total warm start** | **69s** | **14.3s** | **4.8x improvement** |
+| 2026-09-02 | A/B test: per-session lag | Per-session | 1.6s | 1.6s | cuDNN per-thread autotuning, not caused by our changes |
+
+---
+
+### Per-Session Render Warmup (identified 2026-09-02)
+
+**Problem:** Each new WebRTC session spawns a render thread that pays ~1.6s
+cuDNN autotuning before the greeting can fire, then ~3.4s more in background.
+This is the initial lag students feel on first connect. A/B tested: identical
+on optimized and original code — not related to startup optimizations.
+
+**Root cause:** `cudnn.benchmark = True` autotunes per input shape per thread.
+Plans are not shared across threads or persisted across restarts.
+
+**Proposed fix:** Pre-warm a render thread pool at server startup instead of
+spawning fresh threads per session. See `WARM-START-V1.md` for full analysis.
+
+---
+
+## GPU Sizing & Multi-Session Analysis (2026-08-13)
+
+### Can we use T4 instead of L40S? — NO
+
+| Spec | L40S | T4 | Ratio |
+|------|------|-----|-------|
+| FP16 TFLOPS | 362 | 65 | 5.5x |
+| Memory bandwidth | 864 GB/s | 320 GB/s | 2.7x |
+| VRAM | 48 GB | 16 GB | 3x |
+| Cost (on-demand) | ~$2/hr | ~$0.60/hr | 3.3x |
+
+**Why T4 fails:** On L40S at batch 1, per-frame inference is already 39.1ms — break-even
+against the 40ms budget (25 FPS). The system only works because batch 4 gives 16.6ms/frame
+(2.4x headroom to absorb CPU contention spikes).
+
+T4 estimates (3-5.5x slower compute):
+- Batch 1: ~100-120 ms/frame → **8-10 FPS** (unusable)
+- Batch 4: ~45-55 ms/frame → **18-22 FPS** (below 25 FPS target, avatar freezes)
+
+The dev's concern about memory bandwidth is valid — but even before bandwidth matters,
+raw compute FLOPS rule out T4 for real-time 25 FPS lip-sync.
+
+---
+
+### Can we run multiple sessions on one L40S? — YES (max 2)
+
+**VRAM is NOT the constraint:**
+
+| Component | VRAM | Notes |
+|-----------|------|-------|
+| Shared models (UNet + VAE + Whisper + DWPose) | ~4.4 GB | Loaded once, shared across all sessions |
+| Per-avatar latent tensor (1874 frames, 8ch, 32×32, FP16) | ~0.03 GB | Negligible per avatar |
+| Working memory (inference activations, batch-4) | ~1.5 GB | Per concurrent inference |
+| **Total for 1 session** | **~6 GB** | **42 GB free on 48 GB card** |
+
+Even with 5 different avatars loaded, VRAM stays under 10 GB. Memory is not the problem.
+
+**GPU compute IS the constraint:**
+
+Each session at 25 FPS × 16.6 ms/frame (batch 4) = **415ms of GPU time per second**.
+
+| Concurrent sessions | GPU time/sec | Utilization | Headroom | Verdict |
+|---|---|---|---|---|
+| 1 | 415ms | 42% | 58% (2.4x) | Comfortable |
+| 2 | 830ms | 83% | 17% | **Viable — tight but works** |
+| 2 (cross-session batching) | ~700ms | 70% | 30% | **Better — batching helps** |
+| 3 | 1245ms | 125% | None | Frames drop, avatar freezes |
+
+**With cross-session batching** (combining frames from 2 sessions into batch-8 instead
+of two independent batch-4 runs), efficiency improves because larger batches amortize
+kernel launch overhead. Batch 7-8 benchmarks at ~13.8 ms/frame vs 16.6 at batch 4.
+
+**Cost implication:**
+- Current: $2/hr per concurrent session (1 L40S per user)
+- With 2 sessions/GPU: **$1/hr per session** (50% savings)
+- At scale (e.g., 10 concurrent users): 5 GPUs instead of 10
+
+**What's needed to enable multi-session:**
+
+1. **Architecture refactor** — server currently assumes 1 avatar engine. Need to multiplex:
+   - Shared model weights (already loaded once)
+   - Per-session avatar state (latents, frames, blend params)
+   - Per-session WebRTC tracks and audio pipelines
+
+2. **Cross-session GPU scheduler** — batch frames from multiple sessions together:
+   - Collect pending frames across sessions
+   - Form larger batches (batch-8 from 2×batch-4)
+   - Dispatch results back to correct session
+   - Handle barge-in/session-end without stalling the other session
+
+3. **Graceful degradation** — if both sessions talk simultaneously during a CPU spike:
+   - Priority scheduling (first-connected gets priority?)
+   - Dynamic batch size reduction
+   - Frame skip with interpolation
+
+**Risk:** Two sessions talking simultaneously is the worst case — both produce audio that
+needs frame rendering at the same time. Idle sessions (listening) cost ~0 GPU. Real-world
+utilization depends on talk/listen ratio (typically 30-40% talking).
+
+**Realistic capacity with real usage patterns:**
+- Users talk ~30-40% of session time
+- Probability both talk at once: ~16% of time (0.4 × 0.4)
+- Effective GPU load with 2 users: ~42% average, 83% peak
+- Could potentially serve 3 users if willing to accept occasional frame drops during
+  rare 3-way-simultaneous-talking moments
+
+---
+
+### Single container vs two containers? — Single container wins
+
+| | Single container (multi-session) | Two containers (shared GPU) |
+|---|---|---|
+| Models in VRAM | 4.4 GB (loaded once) | **8.8 GB** (duplicated per process) |
+| Cross-session batching | Yes — batch-8 = 13.8 ms/frame | No — each process batches alone at batch-4 |
+| GPU utilization (2 users) | ~70% (with cross-batching) | 83%+ (no batching gain + context-switch tax) |
+| CUDA contexts | 1 (efficient) | 2 (GPU time-slices, ~5-10% overhead) |
+| Cold start cost | 1 × 27s | 2 × 27s |
+| Code complexity | Higher (multiplex sessions in-process) | None (two identical containers) |
+| Failure isolation | One crash kills both sessions | One crash only affects one user |
+| Warm start on new session | Instant (models already loaded) | Full 27s (new container from scratch) |
+
+**Why single container is the right architecture:**
+
+1. **Cross-session batching is the key efficiency win.** Combining frames from 2 sessions
+   into batch-8 drops per-frame cost from 16.6ms to 13.8ms — that's the difference between
+   "tight at 83%" and "comfortable at 70%". Two separate containers can never achieve this
+   because separate CUDA contexts cannot share a kernel launch.
+
+2. **No duplicate model loading.** UNet + VAE + Whisper are loaded once and serve both
+   sessions. Two containers load everything twice — wasting 4.4 GB VRAM and doubling the
+   cold start time.
+
+3. **Second session starts instantly.** With a single container already running, accepting
+   a second user is just allocating per-session state (avatar latents, WebRTC track). No
+   model loading, no warmup — sub-second. Two containers means a full 27s cold start for
+   user #2.
+
+4. **Simpler orchestration.** No need for NVIDIA MPS configuration, GPU sharing policies,
+   or container-level resource limits. One container owns the GPU cleanly.
+
+**When two containers makes sense:**
+- During the transition period before multi-session code is built
+- If failure isolation is critical (one buggy session must not crash the other)
+- For A/B testing different server versions on the same GPU
+
+**Recommendation:** Build toward single-container multi-session. Use two-container as a
+temporary fallback only if multi-session code isn't ready but you need to serve 2 users
+immediately (it'll work — just less efficiently).
+
+---
+
+## Priority Decision Matrix — All Approaches
+
+### Warm Start Optimizations (current: 27s, target: <10s)
+
+| # | Approach | Time saved | Result | Effort | Cost/mo | Risk | Dependencies |
+|---|----------|-----------|--------|--------|---------|------|-------------|
+| W1 | Remove TensorFlow from requirements | ~8-10s | 17-19s | 30 min | $0 | None — unused dep | None |
+| W2 | S3→tmpfs model loading | ~5-6s | ~12s | 2-3 hrs | ~$0 | S3 availability | S3 bucket setup |
+| W3 | EBS provision 500 MB/s | ~5s | ~12s | 10 min | $5-10 | None | AWS console access |
+| W4 | Page cache pre-warming (entrypoint) | ~4-6s | ~12s | 30 min | $0 | None | None |
+| W5 | Reduce warmup passes | ~1-2s | ~10s | 1-2 hrs | $0 | Verify CUDA kernel coverage | Testing |
+| W6 | Convert .pth → safetensors | ~1-2s | ~9s | 2-3 hrs | $0 | Low — format swap | One-time model conversion |
+| W7 | Lazy imports (diffusers, transformers) | ~1-2s | ~8s | 2-3 hrs | $0 | Low | Testing imports still work |
+| W8 | Parallel model loading (threads) | ~1-2s | ~7s | 3-4 hrs | $0 | Thread safety | torch thread-safety |
+
+**Recommended order:** W1 → W2 or W3 → W4 → W5 → measure, then decide if W6-W8 needed.
+
+---
+
+### Cold Start Optimizations (current: ~7min, target: <1min)
+
+| # | Approach | Time saved | Result | Effort | Cost/mo | Risk | Dependencies |
+|---|----------|-----------|--------|--------|---------|------|-------------|
+| C-L1 | **S3 avatar cache (pre-built)** | **~6.5 min** | **~12s** | 4-6 hrs | ~$0.15 | S3 availability | Build pipeline, S3 bucket |
+| C1 | Eliminate disk round-trips | ~55s | ~6 min | 1-2 days | $0 | Medium — refactor prepare() | Code understanding |
+| C2 | Batch DWPose (batch-8) | ~60s | ~5 min | 1 day | $0 | Low — API supports it | mmpose batch API |
+| C3 | Batch BiSeNet (batch-16) | ~140s | ~3 min | 1 day | $0 | Low — standard conv net | Tensor batching code |
+| C4 | Batch VAE encoding | ~9s | ~2.5 min | 3-4 hrs | $0 | Low | VAE batch support |
+| C5 | Defer idle to background | ~30s | ~2 min | 3-4 hrs | $0 | Static frame for first 30s | Background thread |
+| C6 | Pipeline overlap (advanced) | ~40s | ~1.5 min | 2-3 days | $0 | High — concurrency bugs | Complex scheduling |
+
+**Recommended order:** C-L1 first (eliminates cold start problem entirely for known avatars),
+then C1→C3→C2→C5→C4 for new-avatar prep speed.
+
+---
+
+### Infrastructure / Architectural (longer-term)
+
+| # | Approach | Impact | Effort | Cost/mo | Risk | Dependencies |
+|---|----------|--------|--------|---------|------|-------------|
+| A1 | Warm pool (never stop GPU) | 0s start | Infra config | $1,440 (or $720 w/ multi-session) | None | Business decision |
+| A2 | Multi-session (2 users/GPU) | 50% cost reduction | 2-3 weeks | Same GPU cost, 2x capacity | Medium — architecture refactor | Single container redesign |
+| A3 | GPU snapshot (CUDA checkpoint) | ~5s cold start | 2-4 weeks | ~$0 | High — immature tech | Driver 580+, CRIU, testing |
+| A4 | Move to Modal | ~2-5s cold start | 1-2 weeks | Variable (per-second billing) | Vendor lock-in, no WebRTC | Platform migration |
+
+---
+
+### Decision Guide: Which to Implement First?
+
+**If goal = fastest warm start improvement with least effort:**
+→ W1 (remove TF) + W3 (EBS provision) — 40 min of work, 27s → ~12s
+
+**If goal = eliminate cold start for known avatars:**
+→ C-L1 (S3 avatar cache) — 4-6 hrs, cold start 7min → 12s
+
+**If goal = cheapest possible solution:**
+→ W1 (remove TF) + W4 (pre-warming) + C-L1 (S3 cache) — $0/mo, covers both warm and cold
+
+**If goal = production-grade with cost optimization:**
+→ W1 + W2 (S3→tmpfs) + C-L1 (S3 cache) + A2 (multi-session) — $0 infra cost increase,
+   warm start ~10s, cold start ~12s, 2 users per GPU
+
+**If goal = absolute minimum latency (future):**
+→ All above + A3 (GPU snapshot) when CUDA checkpoint matures — sub-5s everything
+
+---
+
+### Summary: Effort vs Impact Chart
+
+```
+Impact (seconds saved)
+│
+│  C-L1 ★★★              (S3 avatar cache — eliminates cold start)
+│  ████████████████████   6.5 min saved, 4-6 hrs effort
+│
+│  W1 ★★★                (Remove TensorFlow)
+│  ████████████           8-10s saved, 30 min effort
+│
+│  C3                     (Batch BiSeNet)
+│  █████████████████      140s saved, 1 day effort
+│
+│  C2                     (Batch DWPose)
+│  ████████████           60s saved, 1 day effort
+│
+│  W2/W3                  (S3→tmpfs or EBS provision)
+│  ██████                 5-6s saved, 2-3 hrs effort
+│
+│  C1                     (Eliminate disk I/O)
+│  ███████████            55s saved, 1-2 days effort
+│
+│  C5                     (Defer idle)
+│  ██████                 30s saved, 3-4 hrs effort
+│
+│  W5-W8                  (Warmup/safetensors/lazy/parallel)
+│  ███                    1-2s each, 2-4 hrs each
+│
+└──────────────────────────────── Effort →
+   30min   2-3hrs   4-6hrs   1day    2-3days   weeks
+```
+
+★★★ = best effort-to-impact ratio (do these first)
+
+---
+
+## How to Measure
+
+```bash
+# Time from container start to "Server started" log:
+docker logs <container> 2>&1 | grep -E "Starting main_server|Server started"
+
+# Detailed phase timing (already logged):
+docker logs <container> 2>&1 | grep -E "\[INFO\]|\[MuseTalk\]"
+```

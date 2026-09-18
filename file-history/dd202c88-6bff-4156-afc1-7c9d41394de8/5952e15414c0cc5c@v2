@@ -1,0 +1,88 @@
+---
+name: project-musetalk-benchmark
+description: "MuseTalk performance benchmark project — environment, progress, and execution plan status"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: dd202c88-6bff-4156-afc1-7c9d41394de8
+  modified: 2026-08-25T10:16:58.343Z
+---
+
+## Project: MuseTalk Inference Pipeline Benchmarking & Optimization
+
+Executing the plan in `/home/ubuntu/avatar-setup/musetalk-analysis/BENCHMARK-TASKS.md` (2558 lines).
+
+**Repos:**
+- `/home/ubuntu/avatar-setup/MuseTalk/` — working copy, branch `perf/optimization-benchmarks`. All code changes go here.
+- `/home/ubuntu/avatar-setup/Taiboli-Musetalk/` — reference ONLY, NO edits.
+- `/home/ubuntu/avatar-setup/musetalk-analysis/` — analysis docs, the BENCHMARK-TASKS.md plan lives here.
+
+**Why:** Optimize the MuseTalk real-time lip-sync pipeline's inference performance on an L40S GPU.
+
+**How to apply:** Every task produces a results markdown in `results/`, every commit needs human approval before push. Quality gate = PSNR/SSIM vs ground truth frames.
+
+## Environment (established)
+
+- GPU: NVIDIA L40S (44.4 GB VRAM), Driver 595.71
+- Python 3.12.3, PyTorch 2.11.0+cu128, cuDNN 9.2.0
+- mmcv 2.2.0 (lite, no C++ ops), mmpose 1.3.2, mmdet 3.3.0
+- diffusers 0.30.2, transformers 5.15.1
+- Venv at `.venv/`, activate with `source .venv/bin/activate`
+- PYTHONPATH must include `musetalk/utils` for face_detection import
+
+## Completed Tasks
+
+### TASK-001 + TASK-000 (combined)
+- Environment setup on cu128 stack (Python 3.12 forced combining these)
+- All model weights downloaded
+- Inference verified end-to-end (60s video, 1500 frames)
+- Ground truth frames at `results/ground_truth/frames/` (1500 PNGs)
+- Report: `results/TASK-001-000.md`
+- Changes NOT yet committed (staged for human approval)
+
+### TASK-002: Baseline Timing (partially complete)
+- Benchmark harness written: `scripts/benchmark.py`
+- Baseline timing completed (3 runs, median reported)
+- Noise floor test completed: **fully deterministic** (all 1500 frames bit-identical between runs)
+
+## Baseline Timing Results (median of 3 runs, batch_size=8)
+
+| Phase | Median (ms) |
+|-------|-------------|
+| Model loading | 12,880 |
+| Frame extraction (ffmpeg) | 6,319 |
+| Whisper audio features | 39 |
+| Face detect + landmarks | 19,840 |
+| VAE encode (all frames) | 3,918 |
+| **UNet total** | **5,445** |
+| UNet per frame | 3.6 |
+| UNet median batch (8 frames) | 28.2 |
+| **VAE decode total** | **12,679** |
+| VAE decode per frame | 8.5 |
+| **Blending total** | **74,574** |
+| Blending per frame | 49.7 |
+| **TOTAL PIPELINE** | **138,016** |
+| Effective FPS | 10.9 |
+| VRAM peak | 36,157 MB |
+
+**Key insight:** Blending (49.7ms/frame) dominates per-frame cost, not UNet (3.6ms) or VAE decode (8.5ms). This aligns with Taiboli's finding that the render path isn't the bottleneck.
+
+## Noise Floor
+
+Pipeline is **fully deterministic** — 1500/1500 frames bit-identical across runs. Any PSNR < inf after an optimization is a REAL quality regression, not measurement noise.
+
+## What's Next (from BENCHMARK-TASKS.md Phase 0 execution order)
+
+1. ~~TASK-000B: torch.compile quick benchmark~~ (can be done as part of TASK-002 report)
+2. TASK-003: Batch scaling curve (UNet at batch 1,2,4,8,16) — `--mode batch_scaling` ready to run
+3. TASK-004: Remove TensorFlow (already confirmed not needed)
+4. TASK-005: Safetensors conversion
+5. Then Phase 4-5: per-frame optimizations, multi-session, final comparison
+
+## Git Status
+
+Branch: `perf/optimization-benchmarks`
+Status: Changes unstaged/uncommitted. Need to:
+1. Stage all changes from TASK-001/000 + benchmark harness
+2. Present `git status` to user
+3. Wait for human approval before committing

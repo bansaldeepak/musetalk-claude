@@ -1,0 +1,518 @@
+"""
+Benchmark harness for MuseTalk inference pipeline.
+Measures per-phase timing using CUDA events and establishes the noise floor.
+
+Usage (from repo root, with .venv activated):
+    PYTHONPATH=musetalk/utils:$PYTHONPATH python scripts/benchmark.py --mode baseline
+    PYTHONPATH=musetalk/utils:$PYTHONPATH python scripts/benchmark.py --mode noise_floor
+    PYTHONPATH=musetalk/utils:$PYTHONPATH python scripts/benchmark.py --mode batch_scaling
+"""
+
+import os
+import sys
+import time
+import json
+import argparse
+import warnings
+import copy
+import glob
+import math
+
+import cv2
+import numpy as np
+import torch
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "musetalk", "utils"))
+
+from musetalk.utils.utils import load_all_model, datagen
+from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
+from musetalk.utils.blending import get_image, get_image_blending, get_image_prepare_material
+from musetalk.utils.face_parsing import FaceParsing
+from musetalk.utils.audio_processor import AudioProcessor
+from musetalk.utils.utils import get_file_type, get_video_fps
+from transformers import WhisperModel
+from skimage.metrics import peak_signal_noise_ratio as compute_psnr
+from skimage.metrics import structural_similarity as compute_ssim
+
+
+class CUDATimer:
+    """GPU-accurate timer using CUDA events."""
+
+    def __init__(self):
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+
+    def start(self):
+        self.start_event.record()
+
+    def stop(self):
+        self.end_event.record()
+        torch.cuda.synchronize()
+        return self.start_event.elapsed_time(self.end_event)
+
+
+class CPUTimer:
+    """Wall-clock timer for CPU-bound phases."""
+
+    def __init__(self):
+        self._start = 0
+
+    def start(self):
+        torch.cuda.synchronize()
+        self._start = time.perf_counter()
+
+    def stop(self):
+        return (time.perf_counter() - self._start) * 1000
+
+
+@torch.no_grad()
+def run_inference_with_timing(args, save_frames_dir=None):
+    """Run the full inference pipeline with per-phase CUDA event timing.
+
+    Mirrors scripts/inference.py exactly — same model loading, same datagen,
+    same blending. Returns (timings_dict, output_frame_list).
+    """
+    device = torch.device("cuda:0")
+    timings = {}
+    timer = CUDATimer()
+    cpu_timer = CPUTimer()
+
+    # ═══ Phase: Model Loading ═══
+    timer.start()
+    vae, unet, pe = load_all_model(
+        unet_model_path=args.unet_model_path,
+        vae_type=args.vae_type,
+        unet_config=args.unet_config,
+        device=device,
+    )
+    pe = pe.half().to(device)
+    vae.vae = vae.vae.half().to(device)
+    unet.model = unet.model.half().to(device)
+
+    audio_processor = AudioProcessor(feature_extractor_path=args.whisper_dir)
+    weight_dtype = unet.model.dtype
+    whisper = WhisperModel.from_pretrained(args.whisper_dir)
+    whisper = whisper.to(device=device, dtype=weight_dtype).eval()
+    whisper.requires_grad_(False)
+
+    fp = FaceParsing(
+        left_cheek_width=args.left_cheek_width,
+        right_cheek_width=args.right_cheek_width,
+    )
+    timings["model_load_ms"] = timer.stop()
+    timings["vram_after_load_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    torch.cuda.reset_peak_memory_stats()
+
+    timesteps = torch.tensor([0], device=device)
+
+    # ═══ Phase: Frame Extraction ═══
+    cpu_timer.start()
+    if get_file_type(args.video_path) == "video":
+        tmp_frame_dir = "/tmp/benchmark_frames"
+        os.makedirs(tmp_frame_dir, exist_ok=True)
+        os.system(f"ffmpeg -y -v fatal -i {args.video_path} -start_number 0 {tmp_frame_dir}/%08d.png")
+        input_img_list = sorted(glob.glob(os.path.join(tmp_frame_dir, "*.png")))
+        fps = get_video_fps(args.video_path)
+    else:
+        input_img_list = [args.video_path]
+        fps = 25
+    timings["frame_extraction_ms"] = cpu_timer.stop()
+    timings["num_source_frames"] = len(input_img_list)
+    timings["fps"] = fps
+
+    # ═══ Phase: Audio Feature Extraction ═══
+    timer.start()
+    whisper_input_features, librosa_length = audio_processor.get_audio_feature(args.audio_path)
+    whisper_chunks = audio_processor.get_whisper_chunk(
+        whisper_input_features,
+        device,
+        weight_dtype,
+        whisper,
+        librosa_length,
+        fps=fps,
+        audio_padding_length_left=args.audio_padding_length_left,
+        audio_padding_length_right=args.audio_padding_length_right,
+    )
+    timings["whisper_feature_ms"] = timer.stop()
+    timings["num_audio_frames"] = whisper_chunks.shape[0]
+
+    # ═══ Phase: Face Detection + Landmarks ═══
+    timer.start()
+    coord_list, frame_list = get_landmark_and_bbox(input_img_list, args.bbox_shift)
+    timings["face_detect_ms"] = timer.stop()
+
+    # ═══ Phase: VAE Encode (includes face parsing for mask) ═══
+    timer.start()
+    crop_frames = []
+    for bbox, frame in zip(coord_list, frame_list):
+        if bbox == coord_placeholder:
+            continue
+        x1, y1, x2, y2 = bbox
+        y2 = min(y2 + args.extra_margin, frame.shape[0])
+        crop_frame = frame[y1:y2, x1:x2]
+        crop_frames.append(cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4))
+    all_latents = vae.get_latents_for_unet_batch(crop_frames)
+    input_latent_list = list(all_latents.split(1))
+    timings["vae_encode_ms"] = timer.stop()
+    timings["num_encoded_frames"] = len(input_latent_list)
+
+    # Create cycled lists (same as inference.py)
+    frame_list_cycle = frame_list + frame_list[::-1]
+    coord_list_cycle = coord_list + coord_list[::-1]
+    input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+
+    # ═══ Phase: UNet + VAE Decode (batched) ═══
+    video_num = len(whisper_chunks)
+    batch_size = args.batch_size
+
+    gen = datagen(
+        whisper_chunks=whisper_chunks,
+        vae_encode_latents=input_latent_list_cycle,
+        batch_size=batch_size,
+        delay_frame=0,
+        device=device,
+    )
+
+    unet_times = []
+    vae_dec_times = []
+    res_frame_list = []
+    total_batches = int(np.ceil(float(video_num) / batch_size))
+
+    timer.start()
+    for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=total_batches, desc="Inference")):
+        # PE
+        audio_feature_batch = pe(whisper_batch)
+        latent_batch = latent_batch.to(dtype=unet.model.dtype)
+
+        # UNet forward
+        ut = CUDATimer()
+        ut.start()
+        pred_latents = unet.model(
+            latent_batch, timesteps, encoder_hidden_states=audio_feature_batch
+        ).sample
+        unet_times.append(ut.stop())
+
+        # VAE decode
+        vd = CUDATimer()
+        vd.start()
+        recon = vae.decode_latents(pred_latents)
+        vae_dec_times.append(vd.stop())
+
+        for res_frame in recon:
+            res_frame_list.append(res_frame)
+
+    timings["inference_total_ms"] = timer.stop()
+    timings["unet_total_ms"] = sum(unet_times)
+    timings["unet_per_frame_ms"] = sum(unet_times) / video_num if video_num else 0
+    timings["unet_median_batch_ms"] = float(np.median(unet_times)) if unet_times else 0
+    timings["unet_p99_batch_ms"] = float(np.percentile(unet_times, 99)) if unet_times else 0
+    timings["vae_decode_total_ms"] = sum(vae_dec_times)
+    timings["vae_decode_per_frame_ms"] = sum(vae_dec_times) / video_num if video_num else 0
+    timings["num_batches"] = total_batches
+
+    # ═══ Phase: Blend Mask Pre-compute (unique frames only) ═══
+    timer.start()
+    n_unique = len(coord_list)
+    unique_blend_cache = []
+    for bbox, frame in zip(coord_list, frame_list):
+        if bbox == coord_placeholder:
+            unique_blend_cache.append(None)
+            continue
+        x1, y1, x2, y2 = bbox
+        y2 = min(y2 + args.extra_margin, frame.shape[0])
+        mask_array, crop_box = get_image_prepare_material(frame, [x1, y1, x2, y2], fp=fp, mode=args.parsing_mode)
+        unique_blend_cache.append((mask_array, crop_box))
+    # Build cycled cache from unique cache (forward + reverse)
+    blend_cache = unique_blend_cache + unique_blend_cache[::-1]
+    timings["mask_precompute_ms"] = timer.stop()
+    timings["mask_precompute_per_frame_ms"] = timings["mask_precompute_ms"] / n_unique if n_unique else 0
+    timings["num_unique_frames_parsed"] = n_unique
+
+    # ═══ Phase: Blending (with cached masks) ═══
+    timer.start()
+    output_frames = []
+    for i, res_frame in enumerate(res_frame_list):
+        cache_idx = i % len(blend_cache)
+        if blend_cache[cache_idx] is None:
+            output_frames.append(frame_list_cycle[i % len(frame_list_cycle)])
+            continue
+        bbox = coord_list_cycle[cache_idx]
+        ori_frame = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
+        x1, y1, x2, y2 = bbox
+        y2 = min(y2 + args.extra_margin, ori_frame.shape[0])
+        try:
+            res_frame_resized = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+        except Exception:
+            output_frames.append(ori_frame)
+            continue
+        mask_array, crop_box = blend_cache[cache_idx]
+        combine_frame = get_image_blending(ori_frame, res_frame_resized, [x1, y1, x2, y2], mask_array, crop_box)
+        output_frames.append(combine_frame)
+    timings["blending_total_ms"] = timer.stop()
+    timings["blending_per_frame_ms"] = timings["blending_total_ms"] / len(res_frame_list) if res_frame_list else 0
+    timings["num_output_frames"] = len(output_frames)
+
+    # Save output frames if requested
+    if save_frames_dir:
+        os.makedirs(save_frames_dir, exist_ok=True)
+        for idx, frame in enumerate(output_frames):
+            cv2.imwrite(os.path.join(save_frames_dir, f"{idx + 1:06d}.png"), frame)
+
+    timings["vram_peak_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+    # Cleanup tmp frames
+    if get_file_type(args.video_path) == "video":
+        import shutil
+        shutil.rmtree("/tmp/benchmark_frames", ignore_errors=True)
+
+    return timings, output_frames
+
+
+def noise_floor_test(args):
+    """Run pipeline twice with determinism flags and compare outputs."""
+    print("=" * 70)
+    print("NOISE FLOOR TEST")
+    print("Running identical pipeline twice to establish measurement floor...")
+    print("=" * 70)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    print("\n[Run A]")
+    _, frames_a = run_inference_with_timing(args)
+    print(f"  Produced {len(frames_a)} frames")
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    print("\n[Run B]")
+    _, frames_b = run_inference_with_timing(args)
+    print(f"  Produced {len(frames_b)} frames")
+
+    n = min(len(frames_a), len(frames_b))
+    psnr_values = []
+    ssim_values = []
+    identical = 0
+
+    for i in range(n):
+        if np.array_equal(frames_a[i], frames_b[i]):
+            identical += 1
+            psnr_values.append(float("inf"))
+            ssim_values.append(1.0)
+        else:
+            p = compute_psnr(frames_a[i], frames_b[i], data_range=255)
+            s = compute_ssim(frames_a[i], frames_b[i], channel_axis=2, data_range=255)
+            psnr_values.append(p)
+            ssim_values.append(s)
+
+    finite_psnr = [p for p in psnr_values if not np.isinf(p)]
+
+    print("\n" + "=" * 70)
+    print("NOISE FLOOR RESULTS")
+    print("=" * 70)
+    print(f"  Total frames compared:     {n}")
+    print(f"  Bit-identical frames:      {identical}/{n} ({100*identical/n:.1f}%)")
+    print(f"  Differing frames:          {n - identical}/{n}")
+    if finite_psnr:
+        print(f"  PSNR (non-identical min):  {min(finite_psnr):.1f} dB")
+        print(f"  PSNR (non-identical mean): {np.mean(finite_psnr):.1f} dB")
+    else:
+        print(f"  PSNR: inf (all bit-identical)")
+    print(f"  SSIM mean:                 {np.mean(ssim_values):.6f}")
+    print(f"  SSIM min:                  {min(ssim_values):.6f}")
+    print()
+    print("INTERPRETATION:")
+    if not finite_psnr:
+        print("  Pipeline is fully deterministic — no noise floor.")
+    else:
+        floor = min(finite_psnr)
+        print(f"  Noise floor = {floor:.1f} dB PSNR")
+        print(f"  Any optimization claiming quality-neutral must stay ABOVE this floor.")
+    print("=" * 70)
+
+    return {
+        "total_frames": n,
+        "identical_frames": identical,
+        "differing_frames": n - identical,
+        "psnr_mean": float(np.mean(finite_psnr)) if finite_psnr else float("inf"),
+        "psnr_min": float(min(finite_psnr)) if finite_psnr else float("inf"),
+        "ssim_mean": float(np.mean(ssim_values)),
+        "ssim_min": float(min(ssim_values)),
+    }
+
+
+@torch.no_grad()
+def batch_scaling_test(args):
+    """Measure UNet and VAE decode throughput at batch 1,2,4,8,16."""
+    print("=" * 70)
+    print("BATCH SCALING TEST (UNet + VAE decode)")
+    print("=" * 70)
+
+    device = torch.device("cuda:0")
+    vae, unet, pe = load_all_model(
+        unet_model_path=args.unet_model_path,
+        vae_type=args.vae_type,
+        unet_config=args.unet_config,
+        device=device,
+    )
+    unet.model = unet.model.half().to(device)
+    vae.vae = vae.vae.half().to(device)
+
+    timesteps = torch.tensor([0], device=device)
+    batch_sizes = [1, 2, 4, 8, 16]
+    results = []
+
+    print(f"\n{'Batch':<6} {'UNet ms/batch':<15} {'UNet ms/frame':<15} {'UNet p99/fr':<13} {'VAE ms/batch':<14} {'VAE ms/frame':<14}")
+    print("-" * 80)
+
+    for bs in batch_sizes:
+        latent = torch.randn(bs, 8, 32, 32, device=device, dtype=torch.float16)
+        audio = torch.randn(bs, 50, 384, device=device, dtype=torch.float16)
+
+        # Warmup
+        for _ in range(20):
+            _ = unet.model(latent, timesteps, encoder_hidden_states=audio).sample
+        torch.cuda.synchronize()
+
+        # Measure UNet (100 iterations)
+        timer = CUDATimer()
+        unet_times = []
+        for _ in range(100):
+            timer.start()
+            _ = unet.model(latent, timesteps, encoder_hidden_states=audio).sample
+            unet_times.append(timer.stop())
+
+        # Measure VAE decode
+        pred_latent = torch.randn(bs, 4, 32, 32, device=device, dtype=torch.float16)
+        for _ in range(20):
+            _ = vae.decode_latents(pred_latent)
+        torch.cuda.synchronize()
+
+        vae_times = []
+        for _ in range(100):
+            timer.start()
+            _ = vae.decode_latents(pred_latent)
+            vae_times.append(timer.stop())
+
+        um = float(np.median(unet_times))
+        up99 = float(np.percentile(unet_times, 99))
+        vm = float(np.median(vae_times))
+
+        result = {
+            "batch_size": bs,
+            "unet_median_ms": um,
+            "unet_per_frame_ms": um / bs,
+            "unet_p99_per_frame_ms": up99 / bs,
+            "vae_dec_median_ms": vm,
+            "vae_dec_per_frame_ms": vm / bs,
+        }
+        results.append(result)
+        print(f"{bs:<6} {um:<15.2f} {um/bs:<15.2f} {up99/bs:<13.2f} {vm:<14.2f} {vm/bs:<14.2f}")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MuseTalk Benchmark Harness")
+    parser.add_argument("--mode", choices=["baseline", "noise_floor", "batch_scaling"], required=True)
+    parser.add_argument("--video_path", default="data/video/yongen.mp4")
+    parser.add_argument("--audio_path", default="data/audio/eng.wav")
+    parser.add_argument("--unet_model_path", default="./models/musetalkV15/unet.pth")
+    parser.add_argument("--unet_config", default="./models/musetalkV15/musetalk.json")
+    parser.add_argument("--vae_type", default="sd-vae")
+    parser.add_argument("--whisper_dir", default="./models/whisper")
+    parser.add_argument("--bbox_shift", type=int, default=0)
+    parser.add_argument("--extra_margin", type=int, default=10)
+    parser.add_argument("--left_cheek_width", type=int, default=90)
+    parser.add_argument("--right_cheek_width", type=int, default=90)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--audio_padding_length_left", type=int, default=2)
+    parser.add_argument("--audio_padding_length_right", type=int, default=2)
+    parser.add_argument("--parsing_mode", default="jaw")
+    parser.add_argument("--save_frames", default=None, help="Dir to save output frames (first run only)")
+    parser.add_argument("--runs", type=int, default=3, help="Number of runs for baseline mode")
+    args = parser.parse_args()
+
+    if args.mode == "noise_floor":
+        result = noise_floor_test(args)
+        print(f"\nJSON: {json.dumps(result)}")
+
+    elif args.mode == "batch_scaling":
+        results = batch_scaling_test(args)
+        print(f"\nJSON: {json.dumps(results)}")
+
+    elif args.mode == "baseline":
+        print("=" * 70)
+        print(f"BASELINE TIMING BENCHMARK ({args.runs} runs, batch_size={args.batch_size})")
+        print(f"Video: {args.video_path}  Audio: {args.audio_path}")
+        print("=" * 70)
+
+        all_timings = []
+        for run_idx in range(args.runs):
+            print(f"\n{'─'*30} Run {run_idx+1}/{args.runs} {'─'*30}")
+            torch.cuda.reset_peak_memory_stats()
+            timings, _ = run_inference_with_timing(
+                args,
+                save_frames_dir=args.save_frames if run_idx == 0 else None,
+            )
+            all_timings.append(timings)
+
+        # Report
+        print("\n" + "=" * 70)
+        print(f"BASELINE RESULTS (median of {args.runs} runs)")
+        print("=" * 70)
+
+        phase_keys = [
+            ("model_load_ms", "Model loading"),
+            ("frame_extraction_ms", "Frame extraction (ffmpeg)"),
+            ("whisper_feature_ms", "Whisper audio features"),
+            ("face_detect_ms", "Face detect + landmarks"),
+            ("vae_encode_ms", "VAE encode (all frames)"),
+            ("inference_total_ms", "Inference total (UNet+VAE dec)"),
+            ("unet_total_ms", "  UNet total"),
+            ("unet_per_frame_ms", "  UNet per frame"),
+            ("unet_median_batch_ms", "  UNet median batch"),
+            ("unet_p99_batch_ms", "  UNet p99 batch"),
+            ("vae_decode_total_ms", "  VAE decode total"),
+            ("vae_decode_per_frame_ms", "  VAE decode per frame"),
+            ("mask_precompute_ms", "Mask precompute (BiSeNet)"),
+            ("mask_precompute_per_frame_ms", "  Mask per unique frame"),
+            ("blending_total_ms", "Blending (cached masks)"),
+            ("blending_per_frame_ms", "  Blending per frame"),
+        ]
+
+        print(f"\n{'Phase':<35} {'Median':>10} {'Min':>10} {'Max':>10}")
+        print(f"{'─'*35} {'─'*10} {'─'*10} {'─'*10}")
+        for key, label in phase_keys:
+            vals = [t[key] for t in all_timings]
+            print(f"{label:<35} {np.median(vals):>10.1f} {min(vals):>10.1f} {max(vals):>10.1f}")
+
+        print(f"\n{'Metric':<35} {'Value':>10}")
+        print(f"{'─'*35} {'─'*10}")
+        print(f"{'Output frames':<35} {all_timings[0]['num_output_frames']:>10d}")
+        print(f"{'Batch size':<35} {args.batch_size:>10d}")
+        print(f"{'VRAM peak (MB)':<35} {all_timings[0]['vram_peak_mb']:>10.0f}")
+        print(f"{'VRAM after load (MB)':<35} {all_timings[0]['vram_after_load_mb']:>10.0f}")
+
+        # Total pipeline time
+        total_keys = ["model_load_ms", "frame_extraction_ms", "whisper_feature_ms",
+                      "face_detect_ms", "vae_encode_ms", "inference_total_ms",
+                      "mask_precompute_ms", "blending_total_ms"]
+        totals = [sum(t[k] for k in total_keys) for t in all_timings]
+        print(f"\n{'TOTAL PIPELINE (ms)':<35} {np.median(totals):>10.1f} {min(totals):>10.1f} {max(totals):>10.1f}")
+        n_frames = all_timings[0]["num_output_frames"]
+        print(f"{'Effective FPS':<35} {n_frames / (np.median(totals) / 1000):>10.1f}")
+
+        print(f"\nJSON: {json.dumps(all_timings[0])}")
+
+
+if __name__ == "__main__":
+    main()
